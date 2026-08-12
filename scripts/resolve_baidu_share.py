@@ -51,8 +51,8 @@ def main():
         send_callback(callback_url, {"job_id": job_id, "status": "error", "error_message": err_msg}, webhook_secret)
         sys.exit(1)
 
-    # 2. Đăng nhập tài khoản Baidu qua CLI baidupcs-py
-    login_cmd = ["baidupcs-py", "login", f"--bduss={bduss}"]
+    # 2. Đăng nhập tài khoản Baidu qua module Python (-m baidupcs_py)
+    login_cmd = [sys.executable, "-m", "baidupcs_py", "login", f"--bduss={bduss}"]
     if stoken:
         login_cmd.append(f"--stoken={stoken}")
 
@@ -64,8 +64,8 @@ def main():
         send_callback(callback_url, {"job_id": job_id, "status": "error", "error_message": err_msg}, webhook_secret)
         sys.exit(1)
 
-    # 3. Gọi lệnh CLI `baidupcs-py save` để lưu file từ link share
-    save_cmd = ["baidupcs-py", "save", share_url, dest_dir]
+    # 3. Gọi lệnh save để lưu file từ link share
+    save_cmd = [sys.executable, "-m", "baidupcs_py", "save", share_url, dest_dir]
     if passcode:
         save_cmd.extend(["-p", passcode])
 
