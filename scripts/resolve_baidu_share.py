@@ -223,6 +223,115 @@ def _call_access_shared(api: BaiduPCSApi, share_url: str, passcode: str) -> Any:
     return access_fn(share_url, passcode)
 
 
+def _call_transfer_shared_paths(api: BaiduPCSApi, dest_dir: str, shared_paths: list[Any]) -> Any:
+    """Gọi `api.transfer_shared_paths()` để transfer các path đã share vào
+    Cloud cá nhân.
+
+    --- BUG MỚI (giống hệt bug đã gặp với access_shared) ---
+    Bản đầu tiên gọi cứng `api.transfer_shared_paths(remotedir=dest_dir,
+    shared_paths=shared_paths)` và bị:
+        TypeError: transfer_shared_paths() got an unexpected keyword
+        argument 'shared_paths'
+    Tức là tên tham số `shared_paths` KHÔNG tồn tại trong chữ ký của bản
+    baidupcs-py đang cài (README không công bố đầy đủ chữ ký tham số của
+    hàm này — y hệt tình trạng của `access_shared()` ở trên).
+
+    Áp dụng ĐÚNG cách tiếp cận đã dùng cho `_call_access_shared()`: tự dò
+    chữ ký bằng `inspect.signature`, map tham số theo TÊN thường gặp, thay
+    vì đoán cứng lần nữa (tránh lặp lại đúng loại lỗi vừa xảy ra).
+
+    Debug log của lần chạy lỗi cho thấy mỗi phần tử `shared_paths` (kiểu
+    `PcsSharedPath`) đã tự mang theo `uk`, `share_id`, `bdstoken`, `fs_id`,
+    `path` — đây chính là các trường mà `transfer_shared_paths()` cần,
+    nên lấy trực tiếp từ đó, không cần gọi thêm API nào khác.
+    """
+    transfer_fn = getattr(api, "transfer_shared_paths", None)
+    if not callable(transfer_fn):
+        raise RuntimeError(
+            "Bản baidupcs-py đang cài KHÔNG có transfer_shared_paths() — "
+            "không thể transfer vào Cloud cá nhân."
+        )
+
+    first = shared_paths[0]
+    uk = getattr(first, "uk", None)
+    share_id = getattr(first, "share_id", None)
+    bdstoken = getattr(first, "bdstoken", None)
+    fs_ids = [getattr(p, "fs_id", None) for p in shared_paths]
+    paths = [p for p in (_entry_path(e) for e in shared_paths) if p]
+
+    try:
+        sig = inspect.signature(transfer_fn)
+        param_names = [
+            p.name for p in sig.parameters.values()
+            if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+        ]
+    except (TypeError, ValueError):
+        param_names = []
+
+    logger.debug(
+        "transfer_shared_paths() có tham số: %s", param_names,
+    )
+
+    kwargs: dict[str, Any] = {}
+    for cand in ("remotedir", "remote_dir", "todir", "dest_dir"):
+        if cand in param_names:
+            kwargs[cand] = dest_dir
+            break
+    if uk is not None:
+        for cand in ("uk", "shared_uk", "from_uk"):
+            if cand in param_names:
+                kwargs[cand] = uk
+                break
+    if share_id is not None:
+        for cand in ("share_id", "shareid"):
+            if cand in param_names:
+                kwargs[cand] = share_id
+                break
+    if bdstoken is not None:
+        for cand in ("bdstoken",):
+            if cand in param_names:
+                kwargs[cand] = bdstoken
+                break
+    # Tham số danh sách file cần transfer — thử các tên hay gặp nhất theo
+    # thứ tự ưu tiên. Với tên gợi ý "path" thì truyền list path string, với
+    # tên gợi ý "fs_id" thì truyền list fs_id, các tên khác (share_list,
+    # shared_paths...) thử truyền thẳng list object gốc trước.
+    list_candidates = (
+        ("fs_ids", fs_ids), ("fsids", fs_ids), ("fid_list", fs_ids),
+        ("remotepaths", paths), ("paths", paths), ("filelist", paths),
+        ("share_list", shared_paths), ("shared_paths", shared_paths),
+        ("shared_path_list", shared_paths),
+    )
+    for cand, value in list_candidates:
+        if cand in param_names and cand not in kwargs:
+            kwargs[cand] = value
+            break
+
+    missing_required = [
+        p.name for p in sig.parameters.values()
+        if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+        and p.default is p.empty
+        and p.name not in kwargs
+        and p.name != "self"
+    ] if param_names else []
+
+    logger.debug(
+        "transfer_shared_paths() sẽ gọi với kwargs keys=%s (tham số bắt "
+        "buộc chưa map được, nếu có, là lỗi cần xem lại: %s)",
+        list(kwargs.keys()), missing_required,
+    )
+
+    if missing_required:
+        raise RuntimeError(
+            f"Không tự dò được đủ tham số bắt buộc cho transfer_shared_paths(): "
+            f"còn thiếu {missing_required}. Chữ ký thực tế của hàm: {param_names}. "
+            f"Cần cập nhật danh sách tên tham số ứng viên trong "
+            f"_call_transfer_shared_paths()."
+        )
+
+    return transfer_fn(**kwargs)
+
+
 def _send_callback(callback_url: str, webhook_secret: str, job_id: str, payload: dict) -> None:
     body = {"job_id": job_id, **payload}
     logger.info("Gửi callback về %s: %s", callback_url, json.dumps(body, ensure_ascii=False))
@@ -341,7 +450,21 @@ def main() -> None:
         # shared_paths() ở trên (object Python mang uk/shareid, không
         # serialize qua JSON được).
         # ------------------------------------------------------------- #
-        api.transfer_shared_paths(remotedir=dest_dir, shared_paths=shared_paths)
+        try:
+            transfer_result = _call_transfer_shared_paths(api, dest_dir, shared_paths)
+            logger.debug("RAW transfer_shared_paths(): %r", transfer_result)
+        except Exception as exc:  # noqa: BLE001
+            errno, errmsg = _extract_errno_errmsg(exc)
+            logger.error(
+                "transfer_shared_paths() raise exception — errno=%s errmsg=%s raw=%r",
+                errno, errmsg, exc,
+            )
+            if _looks_like_captcha_or_cookie_issue(exc):
+                raise RuntimeError(
+                    f"transfer_shared_paths() lỗi nghi do CAPTCHA/mã xác "
+                    f"minh hoặc Cookie BDUSS/STOKEN đã hết hạn: {exc}"
+                ) from exc
+            raise
 
         saved_paths = [p for p in (_entry_path(e) for e in shared_paths) if p]
         logger.info("Transfer thành công — %d path đã lưu vào %s", len(saved_paths), dest_dir)
