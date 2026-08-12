@@ -139,11 +139,22 @@ def _run_cli(
     *,
     mask: set[str] | None = None,
     timeout: int = 120,
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Chạy `cli_path` với `args`, log lại command đã chạy (che các giá trị
     nhạy cảm liệt kê trong `mask` khi in log — KHÔNG ảnh hưởng tới lệnh
     thực thi thật). Luôn trả về CompletedProcess kể cả khi return code != 0
     (không dùng check=True) để _main_ tự quyết định cách raise lỗi.
+
+    `input_text`: nội dung ghi vào stdin của tiến trình con. CẦN THIẾT cho
+    những lệnh của `BaiduPCS-Py` có prompt tương tác dạng "Xxx []: " với
+    default RỖNG (VD lệnh `useradd` luôn hỏi "Account Name []: " dù đã
+    truyền đủ --cookies/--bduss, và option này không được liệt kê trong
+    README). Trên GitHub Actions, stdin của job KHÔNG phải tty và KHÔNG có
+    dữ liệu — nếu không cấp `input_text`, `click` gặp EOF ngay tại prompt
+    và thoát với "Aborted!" thay vì tự nhận default. Truyền vài dòng
+    newline rỗng để "bấm Enter" qua các prompt kiểu này, chấp nhận default
+    hiển thị trong `[]`.
 
     LƯU Ý BẢO MẬT: BDUSS/passcode được truyền qua argv nên về lý thuyết có
     thể thấy được qua `ps aux` trong lúc lệnh đang chạy. Chấp nhận được vì
@@ -159,6 +170,7 @@ def _run_cli(
             capture_output=True,
             text=True,
             timeout=timeout,
+            input=input_text,
         )
     except subprocess.TimeoutExpired as exc:
         logger.error("Lệnh timeout sau %ss: %s", timeout, exc)
@@ -183,6 +195,16 @@ def _looks_like_captcha_or_cookie_issue(text: Any) -> bool:
         "unauthorized", "-6", "cookie", "bduss", "stoken",
     )
     return any(kw in lowered for kw in keywords)
+
+
+def _looks_like_prompt_eof_issue(text: Any) -> bool:
+    """Nhận diện trường hợp CLI abort do gặp EOF trên stdin không tương tác
+    tại một prompt tương tác nào đó (VD "Account Name []: " của `useradd`)
+    — khác với lỗi captcha/cookie, cần hint riêng để không đoán nhầm hướng
+    debug (không phải do Cookie sai, mà do thiếu `input_text` cấp cho
+    prompt đó)."""
+    lowered = str(text).lower()
+    return "abort" in lowered
 
 
 def _extract_errno_errmsg_from_text(text: str) -> tuple[str | None, str | None]:
@@ -265,13 +287,23 @@ def main() -> None:
             ["useradd", "--cookies", cookies_str, "--bduss", bduss],
             mask={cookies_str, bduss},
             timeout=60,
+            # `useradd` luôn hỏi thêm "Account Name []: " (không nằm trong
+            # README) dù đã có --cookies/--bduss. Cấp sẵn vài dòng rỗng để
+            # tự nhận default "" qua prompt này (và các prompt tương tự nếu
+            # có), tránh bị "Aborted!" do EOF trên stdin không tương tác.
+            input_text="\n" * 5,
         )
         if useradd_result.returncode != 0:
             combined = f"{useradd_result.stdout}\n{useradd_result.stderr}".strip()
-            hint = (
-                " (nghi do Cookie BDUSS/STOKEN đã hết hạn hoặc sai)"
-                if _looks_like_captcha_or_cookie_issue(combined) else ""
-            )
+            if _looks_like_prompt_eof_issue(combined):
+                hint = (
+                    " (nghi do CLI có thêm prompt tương tác chưa được cấp "
+                    "input_text — không phải lỗi Cookie)"
+                )
+            elif _looks_like_captcha_or_cookie_issue(combined):
+                hint = " (nghi do Cookie BDUSS/STOKEN đã hết hạn hoặc sai)"
+            else:
+                hint = ""
             raise RuntimeError(f"useradd thất bại{hint}: {combined[-1000:]}")
 
         logger.info("useradd thành công — tài khoản vừa thêm tự động là tài khoản hiện hành.")
@@ -281,7 +313,7 @@ def main() -> None:
         # qua lỗi nếu thư mục đã tồn tại; không ảnh hưởng tới bước `save`
         # phía dưới dù bước này có fail vì lý do gì khác.
         # ------------------------------------------------------------- #
-        mkdir_result = _run_cli(cli_path, ["mkdir", dest_dir], timeout=60)
+        mkdir_result = _run_cli(cli_path, ["mkdir", dest_dir], timeout=60, input_text="\n")
         if mkdir_result.returncode != 0:
             logger.debug(
                 "mkdir %s trả về lỗi (bỏ qua, có thể do đã tồn tại sẵn): %s",
@@ -304,6 +336,10 @@ def main() -> None:
             cli_path, save_args,
             mask={passcode} if passcode else None,
             timeout=480,
+            # Đề phòng có prompt phụ nào đó chưa lường trước; --no-show-vcode
+            # đã lo phần vcode nên đây chỉ là lớp phòng hờ, vô hại nếu không
+            # có prompt nào thật sự đọc tới các dòng rỗng này.
+            input_text="\n\n",
         )
         combined_out = f"{save_result.stdout}\n{save_result.stderr}".strip()
 
