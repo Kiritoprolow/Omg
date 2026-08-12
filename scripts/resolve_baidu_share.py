@@ -2,54 +2,56 @@
 """
 Chạy TRONG GitHub Actions (không chạy trên HF Space).
 
-Nhiệm vụ: gọi CLI `BaiduPCS-Py` (qua subprocess, KHÔNG dùng Python SDK
-`baidupcs_py.baidupcs.BaiduPCSApi` nữa) để verify passcode + resolve link
-share Baidu Pan rồi transfer thẳng vào Cloud cá nhân, sau đó POST kết quả
-(thành công kèm output CLI, hoặc lỗi kèm output CLI để debug) về webhook
-của HF Space.
+Nhiệm vụ: dùng Python SDK `baidupcs_py.baidupcs.BaiduPCSApi` để verify
+passcode + resolve link share Baidu Pan rồi transfer thẳng vào Cloud cá
+nhân, sau đó POST kết quả về webhook của HF Space.
 
---- TẠI SAO CHUYỂN SANG SUBPROCESS + CLI (thay vì Python SDK) ---
-Bản `baidupcs-py` đang cài KHÔNG có `BaiduPCSApi.save_shared()`, và
-`BaiduPCSApi.shared_paths()` cấp thấp không tự verify passcode (luôn trả
-về rỗng nếu link có mật khẩu). CLI `BaiduPCS-Py save` verify passcode NGẦM
-bên trong nên đây là cách chắc chắn nhất, đúng như README chính thức của
-PeterDing/BaiduPCS-Py mô tả.
+--- QUAY LẠI SDK, BỎ HẲN CLI/SUBPROCESS ---
+Đã thử dùng CLI `BaiduPCS-Py` qua subprocess (bản trước của file này) và
+gặp hàng loạt vấn đề prompt tương tác không tài liệu hoá:
+  - `useradd` hỏi thêm "Account Name []: " dù đã có --cookies/--bduss.
+  - Khi KHÔNG cấp stdin: click gặp EOF ngay tại prompt -> "Aborted!".
+  - Khi CÓ cấp stdin (vài dòng newline rỗng): lệnh chạy xong với return
+    code 1, không in gì thêm, không traceback -> hành vi không đoán được,
+    không có cách nào chắc chắn debug tiếp mà không có source code CLI
+    trong tay.
+CLI này rõ ràng được thiết kế để dùng tương tác (con người ngồi gõ), không
+phải cho automation/CI. Card đáng tin cậy hơn cho GitHub Actions là gọi
+thẳng Python SDK — không có prompt, lỗi trả về là Python exception rõ
+ràng, dễ log/debug.
 
---- CÁC LỖI ĐÃ GẶP TRƯỚC ĐÓ VÀ LÝ DO (đối chiếu với README chính thức) ---
-1. `subprocess.run(["baidupcs-py", ...])` → FileNotFoundError.
-   Lý do: tên lệnh viết HOA/thường đúng là `BaiduPCS-Py`, không phải
-   `baidupcs-py` viết thường toàn bộ.
-2. `python -m baidupcs_py` → No module named baidupcs_py.__main__.
-   Lý do: gói này không có `__main__.py`, chỉ có console-script entry
-   point tên `BaiduPCS-Py` do pip cài vào thư mục bin.
-3. `BaiduPCS-Py login` → Error: No command: login.
-   Lý do: KHÔNG có lệnh `login`. Lệnh đúng để nạp cookie/bduss là
-   `useradd`.
-4. `BaiduPCS-Py --bduss=...` → Error: No such option '--bduss'.
-   Lý do: `--bduss` là option của SUB-COMMAND `useradd`
-   (`BaiduPCS-Py useradd --bduss=...`), không phải option cấp cao nhất
-   của chương trình.
+--- ĐÂY MỚI LÀ ĐIỂM MẤU CHỐT SỬA LỖI GỐC ---
+Bug đầu tiên được báo cáo: `api.shared_paths()` luôn trả về RỖNG với link
+có passcode, vì "chưa verify Passcode (thiếu cookie phiên BDCLND)". README
+chính thức của BaiduPCS-Py liệt kê `BaiduPCSApi.access_shared` là một API
+method có thật (trong danh sách "api không thread-safe"). Đây chính là
+hàm để verify passcode + set cookie BDCLND — bước đã bị BỎ SÓT ở mọi lần
+thử trước (kể cả bản gốc ban đầu chỉ gọi thẳng `shared_paths()`).
 
---- ĐIỂM QUAN TRỌNG DỄ BỎ SÓT ---
-Theo README: nếu chỉ thêm `--bduss` mà KHÔNG có `--cookies` chứa giá trị
-STOKEN, tài khoản đó sẽ KHÔNG dùng được lệnh `share`/`save` để lưu link
-người khác chia sẻ. Vì vậy script này LUÔN ghép STOKEN vào chuỗi
-`--cookies` (không chỉ truyền `--bduss` riêng lẻ).
+Do README không công bố rõ chữ ký tham số đầy đủ của `access_shared()`,
+hàm `_call_access_shared()` bên dưới tự dò chữ ký bằng `inspect.signature`
+rồi gọi bằng đúng tên tham số của bản đang cài, thay vì đoán cứng cú pháp
+(tránh lặp lại kiểu lỗi "đoán sai cú pháp" đã gặp nhiều lần với CLI).
+
+shared_paths() và transfer_shared_paths() PHẢI chạy trong CÙNG 1 process
+vì kết quả của shared_paths() là các object Python (mang uk/shareid)
+không thể serialize qua JSON để dùng lại ở process khác — đây là lý do
+toàn bộ bước "transfer vào cloud" phải nằm gọn trong GitHub Actions.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
 import re
-import shutil
-import site
-import subprocess
 import sys
 from typing import Any
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import requests
+from baidupcs_py.baidupcs import BaiduPCSApi
 
 logging.basicConfig(
     level=logging.DEBUG,
@@ -62,10 +64,8 @@ def _log_env_snapshot() -> None:
     """Log NGAY LẬP TỨC tình trạng có/không của toàn bộ biến môi trường quan
     trọng — chạy TRƯỚC mọi lệnh _env() bắt buộc, để nếu có lỗi "Thiếu biến
     môi trường bắt buộc: X" thì log vẫn cho thấy TOÀN CẢNH biến nào có/thiếu
-    trong CÙNG 1 lần chạy, thay vì chỉ báo đúng 1 biến đầu tiên rồi dừng —
-    giúp debug nhanh khi workflow.yml bị thiếu/sai tên key trong `env:`.
-    Giá trị nhạy cảm (BDUSS/STOKEN/secret/token) chỉ log ĐỘ DÀI, không log
-    giá trị thật."""
+    trong CÙNG 1 lần chạy. Giá trị nhạy cảm chỉ log ĐỘ DÀI, không log giá
+    trị thật."""
     sensitive = {"BAIDU_BDUSS", "BAIDU_STOKEN", "BAIDU_WEBHOOK_SECRET", "HF_TOKEN"}
     names = [
         "JOB_ID", "SHARE_URL", "PASSCODE", "DEST_DIR", "CALLBACK_URL",
@@ -91,130 +91,136 @@ def _env(name: str, required: bool = True) -> str:
     return val
 
 
-def _find_cli() -> str:
-    """Dò tìm đường dẫn file thực thi CLI `BaiduPCS-Py` (CHÚ Ý: viết đúng
-    HOA/thường, không phải `baidupcs-py`).
+def _extract_errno_errmsg(raw: Any) -> tuple[Any, Any]:
+    """Bóc errno/errmsg từ RAW response hoặc exception — dùng để debug khi
+    kết quả rỗng hoặc lib raise lỗi mập mờ."""
+    errno = None
+    errmsg = None
+    if raw is None:
+        return errno, errmsg
 
-    Thử theo thứ tự, dừng ở bước đầu tiên tìm thấy:
-    1. `shutil.which("BaiduPCS-Py")` — trường hợp thư mục Scripts/bin của
-       Python hiện tại đã nằm trong PATH.
-    2. Cùng thư mục với `sys.executable` — đây là nơi pip cài entry point
-       console-script của đúng bản Python đang chạy script này. Cách này
-       ỔN ĐỊNH HƠN hardcode đường dẫn kiểu
-       `/opt/hostedtoolcache/Python/3.10.20/x64/bin/BaiduPCS-Py` (đã dò
-       thủ công trước đó), vì số phiên bản patch Python (`3.10.20`) có thể
-       đổi bất kỳ lúc nào khi GitHub cập nhật runner image, trong khi
-       `os.path.dirname(sys.executable)` luôn tự trỏ đúng.
-    3. Thư mục bin trong `site.getuserbase()` — phòng trường hợp cài bằng
-       `pip install --user`.
-    """
-    which = shutil.which("BaiduPCS-Py")
-    if which:
-        logger.debug("Tìm thấy CLI qua PATH: %s", which)
-        return which
+    if isinstance(raw, dict):
+        errno = raw.get("errno")
+        errmsg = raw.get("errmsg") or raw.get("err_msg") or raw.get("show_msg")
+        if errno is not None or errmsg is not None:
+            return errno, errmsg
 
-    candidate = os.path.join(os.path.dirname(sys.executable), "BaiduPCS-Py")
-    if os.path.isfile(candidate):
-        logger.debug("Tìm thấy CLI cùng thư mục với sys.executable: %s", candidate)
-        return candidate
+    for attr in ("errno", "error_code", "code"):
+        val = getattr(raw, attr, None)
+        if val is not None:
+            errno = val
+            break
+    for attr in ("errmsg", "err_msg", "message", "show_msg"):
+        val = getattr(raw, attr, None)
+        if val:
+            errmsg = val
+            break
 
-    try:
-        user_candidate = os.path.join(site.getuserbase(), "bin", "BaiduPCS-Py")
-        if os.path.isfile(user_candidate):
-            logger.debug("Tìm thấy CLI trong user base: %s", user_candidate)
-            return user_candidate
-    except Exception:  # noqa: BLE001
-        pass
+    if isinstance(raw, BaseException) and errno is None and errmsg is None:
+        msg = str(raw)
+        m_errno = re.search(r"errno[\"']?\s*[:=]\s*(-?\d+)", msg, re.IGNORECASE)
+        m_errmsg = re.search(r"err(?:_)?msg[\"']?\s*[:=]\s*[\"']?([^\"',}]+)", msg, re.IGNORECASE)
+        if m_errno:
+            errno = m_errno.group(1)
+        if m_errmsg:
+            errmsg = m_errmsg.group(1).strip()
 
-    logger.error(
-        "Không tìm thấy file thực thi CLI `BaiduPCS-Py`. Đã thử: PATH, %s",
-        candidate,
-    )
-    sys.exit(1)
+    return errno, errmsg
 
 
-def _run_cli(
-    cli_path: str,
-    args: list[str],
-    *,
-    mask: set[str] | None = None,
-    timeout: int = 120,
-    input_text: str | None = None,
-) -> subprocess.CompletedProcess:
-    """Chạy `cli_path` với `args`, log lại command đã chạy (che các giá trị
-    nhạy cảm liệt kê trong `mask` khi in log — KHÔNG ảnh hưởng tới lệnh
-    thực thi thật). Luôn trả về CompletedProcess kể cả khi return code != 0
-    (không dùng check=True) để _main_ tự quyết định cách raise lỗi.
-
-    `input_text`: nội dung ghi vào stdin của tiến trình con. CẦN THIẾT cho
-    những lệnh của `BaiduPCS-Py` có prompt tương tác dạng "Xxx []: " với
-    default RỖNG (VD lệnh `useradd` luôn hỏi "Account Name []: " dù đã
-    truyền đủ --cookies/--bduss, và option này không được liệt kê trong
-    README). Trên GitHub Actions, stdin của job KHÔNG phải tty và KHÔNG có
-    dữ liệu — nếu không cấp `input_text`, `click` gặp EOF ngay tại prompt
-    và thoát với "Aborted!" thay vì tự nhận default. Truyền vài dòng
-    newline rỗng để "bấm Enter" qua các prompt kiểu này, chấp nhận default
-    hiển thị trong `[]`.
-
-    LƯU Ý BẢO MẬT: BDUSS/passcode được truyền qua argv nên về lý thuyết có
-    thể thấy được qua `ps aux` trong lúc lệnh đang chạy. Chấp nhận được vì
-    GitHub Actions runner là VM dùng riêng cho 1 job rồi huỷ ngay, không có
-    tiến trình lạ nào khác cùng chạy trên máy để dòm ps list.
-    """
-    display_args = [("***" if a in mask else a) for a in args] if mask else args
-    logger.info("Chạy lệnh: %s %s", cli_path, " ".join(display_args))
-
-    try:
-        result = subprocess.run(
-            [cli_path, *args],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            input=input_text,
-        )
-    except subprocess.TimeoutExpired as exc:
-        logger.error("Lệnh timeout sau %ss: %s", timeout, exc)
-        raise RuntimeError(
-            f"CLI timeout sau {timeout}s khi chạy `{args[0] if args else ''}`"
-        ) from exc
-
-    logger.debug("Return code: %s", result.returncode)
-    logger.debug("STDOUT:\n%s", result.stdout)
-    logger.debug("STDERR:\n%s", result.stderr)
-    return result
+def _entry_path(entry: Any) -> str | None:
+    if isinstance(entry, dict):
+        return entry.get("path") or entry.get("remotepath")
+    return getattr(entry, "path", None) or getattr(entry, "remotepath", None)
 
 
-def _looks_like_captcha_or_cookie_issue(text: Any) -> bool:
-    """Nhận diện sơ bộ (dựa trên keyword) xem output/lỗi có khả năng do
-    CAPTCHA/mã xác minh (vcode) hoặc Cookie (BDUSS/STOKEN) đã hết hạn hay
-    không — giúp error_message trả về HF Space đủ cụ thể để không phải
-    đoán mò."""
-    lowered = str(text).lower()
+def _build_full_share_url(share_url: str, passcode: str) -> str:
+    """Ghép passcode vào URL dưới dạng query string `?pwd=...`. GIỮ HÀM NÀY
+    làm lớp phòng hờ vô hại — một số version/route nội bộ của thư viện có
+    thể đọc pwd từ URL — nhưng KHÔNG còn là cơ chế verify chính (đó là việc
+    của `access_shared()` bên dưới). Nếu URL đã có sẵn `?pwd=...` thì GIỮ
+    NGUYÊN, không ghi đè."""
+    if not passcode:
+        return share_url
+
+    parsed = urlparse(share_url)
+    query = parse_qs(parsed.query)
+    if query.get("pwd") and query["pwd"][0]:
+        return share_url
+
+    query["pwd"] = [passcode]
+    new_query = urlencode(query, doseq=True)
+    return urlunparse(parsed._replace(query=new_query))
+
+
+def _looks_like_captcha_or_cookie_issue(exc_or_text: Any) -> bool:
+    """Nhận diện sơ bộ (dựa trên keyword) xem lỗi có khả năng do CAPTCHA/mã
+    xác minh (vcode) hoặc Cookie (BDUSS/STOKEN) đã hết hạn hay không — giúp
+    error_message trả về HF Space đủ cụ thể để không phải đoán mò."""
+    text = str(exc_or_text).lower()
     keywords = (
         "vcode", "captcha", "verify", "验证码", "登录", "login",
         "unauthorized", "-6", "cookie", "bduss", "stoken",
     )
-    return any(kw in lowered for kw in keywords)
+    return any(kw in text for kw in keywords)
 
 
-def _looks_like_prompt_eof_issue(text: Any) -> bool:
-    """Nhận diện trường hợp CLI abort do gặp EOF trên stdin không tương tác
-    tại một prompt tương tác nào đó (VD "Account Name []: " của `useradd`)
-    — khác với lỗi captcha/cookie, cần hint riêng để không đoán nhầm hướng
-    debug (không phải do Cookie sai, mà do thiếu `input_text` cấp cho
-    prompt đó)."""
-    lowered = str(text).lower()
-    return "abort" in lowered
+def _call_access_shared(api: BaiduPCSApi, share_url: str, passcode: str) -> Any:
+    """Gọi `api.access_shared()` để verify passcode + set cookie BDCLND —
+    ĐÂY LÀ BƯỚC BỊ THIẾU khiến `shared_paths()` luôn trả về rỗng với link
+    có passcode ở MỌI lần thử trước đó.
 
+    README chính thức chỉ xác nhận method này TỒN TẠI (trong danh sách "api
+    không thread-safe"), không công bố chữ ký tham số đầy đủ. Thay vì đoán
+    cứng, hàm này tự dò chữ ký bằng `inspect.signature` rồi map tham số URL
+    và password theo TÊN thường gặp, chỉ fallback sang gọi theo VỊ TRÍ
+    (url, password) nếu không dò được — đúng thứ tự y hệt CLI:
+    `save SHARED_URL DEST_DIR -p PASSWORD`.
+    """
+    if not passcode:
+        return None
 
-def _extract_errno_errmsg_from_text(text: str) -> tuple[str | None, str | None]:
-    """Bóc errno/errmsg (nếu có) từ output text của CLI — dùng để debug khi
-    `save` thất bại, output CLI thường in kèm errno/errmsg gốc từ Baidu."""
-    m_errno = re.search(r"errno[\"']?\s*[:=]\s*(-?\d+)", text, re.IGNORECASE)
-    m_errmsg = re.search(r"err(?:_)?msg[\"']?\s*[:=]\s*[\"']?([^\"',}\n]+)", text, re.IGNORECASE)
-    errno = m_errno.group(1) if m_errno else None
-    errmsg = m_errmsg.group(1).strip() if m_errmsg else None
-    return errno, errmsg
+    access_fn = getattr(api, "access_shared", None)
+    if not callable(access_fn):
+        logger.warning(
+            "Bản baidupcs-py đang cài KHÔNG có access_shared() — bỏ qua "
+            "bước verify passcode tường minh, để shared_paths() tự xử lý "
+            "(nhiều khả năng sẽ trả rỗng nếu link có passcode).",
+        )
+        return None
+
+    try:
+        sig = inspect.signature(access_fn)
+        param_names = [
+            p.name for p in sig.parameters.values()
+            if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+        ]
+    except (TypeError, ValueError):
+        param_names = []
+
+    kwargs: dict[str, str] = {}
+    for cand in ("shared_url", "share_url", "url"):
+        if cand in param_names:
+            kwargs[cand] = share_url
+            break
+    for cand in ("password", "passwd", "pwd", "passcode"):
+        if cand in param_names:
+            kwargs[cand] = passcode
+            break
+
+    logger.debug(
+        "access_shared() có tham số: %s — sẽ gọi với kwargs keys=%s",
+        param_names, list(kwargs.keys()),
+    )
+
+    if len(kwargs) == 2:
+        return access_fn(**kwargs)
+
+    logger.debug(
+        "Không map được đủ 2 tham số qua introspection — fallback gọi "
+        "theo vị trí access_shared(share_url, passcode).",
+    )
+    return access_fn(share_url, passcode)
 
 
 def _send_callback(callback_url: str, webhook_secret: str, job_id: str, payload: dict) -> None:
@@ -262,128 +268,103 @@ def main() -> None:
 
     logger.info("Job %s — resolving share_url=%s -> dest_dir=%s", job_id, share_url, dest_dir)
 
-    cli_path = _find_cli()
-    logger.info("Dùng CLI tại: %s", cli_path)
-
     try:
-        # ------------------------------------------------------------- #
-        # BƯỚC 1 — `useradd` KHÔNG TƯƠNG TÁC. Ghép STOKEN vào --cookies vì
-        # theo README chính thức, nếu cookies không có STOKEN thì tài
-        # khoản đó không dùng được lệnh `save` để lưu link người khác chia
-        # sẻ (chỉ có --bduss riêng lẻ là không đủ).
-        # ------------------------------------------------------------- #
-        cookies_str = f"BDUSS={bduss};"
-        if stoken:
-            cookies_str += f" STOKEN={stoken};"
-        else:
-            logger.warning(
-                "Không có BAIDU_STOKEN — theo README, thiếu STOKEN trong "
-                "cookies sẽ khiến lệnh `save` không dùng được. Vẫn thử "
-                "chạy để log lỗi cụ thể nếu có.",
-            )
-
-        useradd_result = _run_cli(
-            cli_path,
-            ["useradd", "--cookies", cookies_str, "--bduss", bduss],
-            mask={cookies_str, bduss},
-            timeout=60,
-            # `useradd` luôn hỏi thêm "Account Name []: " (không nằm trong
-            # README) dù đã có --cookies/--bduss. Cấp sẵn vài dòng rỗng để
-            # tự nhận default "" qua prompt này (và các prompt tương tự nếu
-            # có), tránh bị "Aborted!" do EOF trên stdin không tương tác.
-            input_text="\n" * 5,
-        )
-        if useradd_result.returncode != 0:
-            combined = f"{useradd_result.stdout}\n{useradd_result.stderr}".strip()
-            if _looks_like_prompt_eof_issue(combined):
-                hint = (
-                    " (nghi do CLI có thêm prompt tương tác chưa được cấp "
-                    "input_text — không phải lỗi Cookie)"
-                )
-            elif _looks_like_captcha_or_cookie_issue(combined):
-                hint = " (nghi do Cookie BDUSS/STOKEN đã hết hạn hoặc sai)"
-            else:
-                hint = ""
-            raise RuntimeError(f"useradd thất bại{hint}: {combined[-1000:]}")
-
-        logger.info("useradd thành công — tài khoản vừa thêm tự động là tài khoản hiện hành.")
+        api = BaiduPCSApi(bduss=bduss, stoken=stoken or None)
 
         # ------------------------------------------------------------- #
-        # BƯỚC 2 (best-effort) — tạo trước DEST_DIR trên Baidu Cloud. Bỏ
-        # qua lỗi nếu thư mục đã tồn tại; không ảnh hưởng tới bước `save`
-        # phía dưới dù bước này có fail vì lý do gì khác.
+        # BƯỚC 1 (nếu có passcode) — access_shared() để verify passcode và
+        # set cookie BDCLND. THIẾU bước này là lý do gốc shared_paths()
+        # luôn trả về rỗng ở mọi lần thử trước.
         # ------------------------------------------------------------- #
-        mkdir_result = _run_cli(cli_path, ["mkdir", dest_dir], timeout=60, input_text="\n")
-        if mkdir_result.returncode != 0:
-            logger.debug(
-                "mkdir %s trả về lỗi (bỏ qua, có thể do đã tồn tại sẵn): %s",
-                dest_dir, (mkdir_result.stdout + mkdir_result.stderr).strip()[-500:],
-            )
-
-        # ------------------------------------------------------------- #
-        # BƯỚC 3 — `save SHARE_URL DEST_DIR -p PASSCODE --no-show-vcode`.
-        # `--no-show-vcode` BẮT BUỘC trong môi trường non-interactive: nếu
-        # Baidu yêu cầu mã xác minh (vcode) mà không có cờ này, CLI sẽ cố
-        # hỏi nhập tương tác → treo cho tới khi hết `timeout-minutes` của
-        # job, thay vì trả lỗi ngay để mình debug được.
-        # ------------------------------------------------------------- #
-        save_args = ["save", share_url, dest_dir]
         if passcode:
-            save_args += ["-p", passcode]
-        save_args.append("--no-show-vcode")
+            logger.info("Verify passcode qua access_shared() (set cookie BDCLND)...")
+            try:
+                access_result = _call_access_shared(api, share_url, passcode)
+                logger.debug("RAW access_shared(): %r", access_result)
+            except Exception as exc:  # noqa: BLE001
+                errno, errmsg = _extract_errno_errmsg(exc)
+                logger.error(
+                    "access_shared(%s) raise exception — errno=%s errmsg=%s raw=%r",
+                    share_url, errno, errmsg, exc,
+                )
+                if _looks_like_captcha_or_cookie_issue(exc):
+                    raise RuntimeError(
+                        f"access_shared() lỗi nghi do sai passcode, CAPTCHA/mã "
+                        f"xác minh, hoặc Cookie BDUSS/STOKEN đã hết hạn: {exc}"
+                    ) from exc
+                raise
+        else:
+            logger.info("Link không có passcode — bỏ qua bước access_shared().")
 
-        save_result = _run_cli(
-            cli_path, save_args,
-            mask={passcode} if passcode else None,
-            timeout=480,
-            # Đề phòng có prompt phụ nào đó chưa lường trước; --no-show-vcode
-            # đã lo phần vcode nên đây chỉ là lớp phòng hờ, vô hại nếu không
-            # có prompt nào thật sự đọc tới các dòng rỗng này.
-            input_text="\n\n",
-        )
-        combined_out = f"{save_result.stdout}\n{save_result.stderr}".strip()
-
-        if save_result.returncode != 0:
-            errno, errmsg = _extract_errno_errmsg_from_text(combined_out)
-            hint = (
-                " (nghi do sai passcode, cần mã xác minh/vcode, hoặc Cookie "
-                "BDUSS/STOKEN hết hạn)"
-                if _looks_like_captcha_or_cookie_issue(combined_out) else ""
-            )
+        # ------------------------------------------------------------- #
+        # BƯỚC 2 — shared_paths(). Sau khi access_shared() đã set cookie
+        # BDCLND (nếu có passcode), lệnh này giờ mới có thể trả đúng danh
+        # sách file thay vì rỗng.
+        # ------------------------------------------------------------- #
+        try:
+            shared_paths = api.shared_paths(share_url)
+        except Exception as exc:  # noqa: BLE001
+            errno, errmsg = _extract_errno_errmsg(exc)
             logger.error(
-                "save thất bại — errno=%s errmsg=%s output=%s",
-                errno, errmsg, combined_out[-1500:],
+                "shared_paths(%s) raise exception — errno=%s errmsg=%s raw=%r",
+                share_url, errno, errmsg, exc,
             )
+            if _looks_like_captcha_or_cookie_issue(exc):
+                raise RuntimeError(
+                    f"shared_paths() lỗi nghi do CAPTCHA/mã xác minh hoặc "
+                    f"Cookie BDUSS/STOKEN đã hết hạn: {exc}"
+                ) from exc
+            raise
+
+        logger.debug("RAW shared_paths(): %r", shared_paths)
+
+        if not shared_paths:
+            errno, errmsg = _extract_errno_errmsg(shared_paths)
+            logger.error("shared_paths() trả về rỗng — errno=%s errmsg=%s", errno, errmsg)
             _send_callback(
                 callback_url, webhook_secret, job_id,
                 {
                     "status": "error",
-                    "error_message": f"save thất bại{hint}: {combined_out[-1500:]}",
+                    "error_message": (
+                        "Danh sách file rỗng dù đã gọi access_shared() — link có "
+                        "thể đã die, bị gỡ, sai passcode, hoặc Cookie "
+                        "BAIDU_BDUSS/BAIDU_STOKEN đã hết hạn."
+                    ),
                     "errno": errno,
                     "errmsg": errmsg,
                 },
             )
             sys.exit(1)
 
-        logger.info("save thành công vào %s", dest_dir)
-        logger.debug("save output:\n%s", combined_out)
+        # ------------------------------------------------------------- #
+        # BƯỚC 3 — transfer_shared_paths() PHẢI chạy cùng process với
+        # shared_paths() ở trên (object Python mang uk/shareid, không
+        # serialize qua JSON được).
+        # ------------------------------------------------------------- #
+        api.transfer_shared_paths(remotedir=dest_dir, shared_paths=shared_paths)
+
+        saved_paths = [p for p in (_entry_path(e) for e in shared_paths) if p]
+        logger.info("Transfer thành công — %d path đã lưu vào %s", len(saved_paths), dest_dir)
 
         _send_callback(
             callback_url, webhook_secret, job_id,
             {
                 "status": "success",
                 "dest_dir": dest_dir,
-                "cli_output": combined_out[-2000:],
+                "saved_paths": saved_paths,
             },
         )
 
     except Exception as exc:  # noqa: BLE001
+        errno, errmsg = _extract_errno_errmsg(exc)
         logger.exception("Resolve/transfer thất bại")
         _send_callback(
             callback_url, webhook_secret, job_id,
             {
                 "status": "error",
                 "error_message": str(exc),
+                "errno": errno,
+                "errmsg": errmsg,
             },
         )
         sys.exit(1)
