@@ -1,8 +1,5 @@
 name: Baidu Pan Resolver
 
-# Được kích hoạt bởi HF Space qua GitHub Repository Dispatch API:
-#   POST https://api.github.com/repos/{owner}/{repo}/dispatches
-#   Body: {"event_type": "resolve_baidu_share", "client_payload": {...}}
 on:
   repository_dispatch:
     types: [resolve_baidu_share]
@@ -10,7 +7,6 @@ on:
 jobs:
   resolve:
     runs-on: ubuntu-latest
-    # Chặn timeout job dài quá mức nếu Baidu API bị treo/rate-limit
     timeout-minutes: 10
     steps:
       - name: Checkout repo
@@ -32,9 +28,9 @@ jobs:
           BAIDU_STOKEN: ${{ secrets.BAIDU_STOKEN }}
           BAIDU_WEBHOOK_SECRET: ${{ secrets.BAIDU_WEBHOOK_SECRET }}
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          JOB_ID: ${{ github.event.client_payload.job_id }}
+          SHARE_URL: ${{ github.event.client_payload.share_url }}
+          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
         run: |
-          python scripts/resolve_baidu_share.py \
-            '${{ github.event.client_payload.share_url }}' \
-            '${{ github.event.client_payload.callback_url }}' \
-            '${{ github.event.client_payload.job_id }}'
-            
+          python scripts/resolve_baidu_share.py
+          
