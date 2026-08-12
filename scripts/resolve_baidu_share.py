@@ -22,6 +22,7 @@ import os
 import re
 import sys
 from typing import Any
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 import requests
 from baidupcs_py.baidupcs import BaiduPCSApi
@@ -109,6 +110,42 @@ def _entry_path(entry: Any) -> str | None:
     return getattr(entry, "path", None) or getattr(entry, "remotepath", None)
 
 
+def _build_full_share_url(share_url: str, passcode: str) -> str:
+    """Ghép passcode vào URL dưới dạng query string `?pwd=...` — BẮT BUỘC
+    vì shared_paths() của baidupcs-py CHỈ đọc pwd từ NGAY TRONG URL, không
+    nhận tham số password/passcode riêng (đã xác nhận qua log lỗi thực tế
+    ở các lượt trước). Nếu HF Space gửi `share_url` và `passcode` TÁCH RỜI
+    nhau trong client_payload (đúng tình huống gây lỗi "danh sách rỗng" lần
+    này), URL gốc sẽ KHÔNG có ?pwd=, khiến Baidu coi đây là truy cập không
+    mật khẩu và trả về rỗng dù passcode có đúng đi nữa.
+
+    Nếu URL đã có sẵn `?pwd=...` (khác rỗng) thì GIỮ NGUYÊN, không ghi đè —
+    tôn trọng giá trị đã có trong URL gốc."""
+    if not passcode:
+        return share_url
+
+    parsed = urlparse(share_url)
+    query = parse_qs(parsed.query)
+    if query.get("pwd") and query["pwd"][0]:
+        return share_url
+
+    query["pwd"] = [passcode]
+    new_query = urlencode(query, doseq=True)
+    return urlunparse(parsed._replace(query=new_query))
+
+
+def _looks_like_captcha_or_cookie_issue(exc_or_text: Any) -> bool:
+    """Nhận diện sơ bộ (dựa trên keyword) xem lỗi có khả năng do CAPTCHA/mã
+    xác minh (vcode) hoặc Cookie (BDUSS/STOKEN) đã hết hạn hay không — giúp
+    error_message trả về HF Space đủ cụ thể để không phải đoán mò."""
+    text = str(exc_or_text).lower()
+    keywords = (
+        "vcode", "captcha", "verify", "验证码", "登录", "login",
+        "unauthorized", "-6", "cookie", "bduss", "stoken",
+    )
+    return any(kw in text for kw in keywords)
+
+
 def _send_callback(callback_url: str, webhook_secret: str, job_id: str, payload: dict) -> None:
     body = {"job_id": job_id, **payload}
     logger.info("Gửi callback về %s: %s", callback_url, json.dumps(body, ensure_ascii=False))
@@ -154,23 +191,67 @@ def main() -> None:
 
     logger.info("Job %s — resolving share_url=%s -> dest_dir=%s", job_id, share_url, dest_dir)
 
+    full_url = _build_full_share_url(share_url, passcode)
+    if passcode:
+        # Log URL đã ghép pwd nhưng CHE bớt giá trị passcode thật trong log
+        # công khai của GitHub Actions (dù ít nhạy cảm hơn BDUSS/STOKEN,
+        # passcode share vẫn không nên lộ trần trong log build public).
+        _masked = full_url.replace(f"pwd={passcode}", f"pwd={'*' * len(passcode)}")
+        logger.debug("Full URL (đã ghép passcode, che 1 phần): %s", _masked)
+
     try:
         api = BaiduPCSApi(bduss=bduss, stoken=stoken or None)
 
         # shared_paths(full_url) — CHỈ 1 tham số, URL đầy đủ kèm ?pwd=...
         # (baidupcs-py không hỗ trợ password/passcode riêng — xem ghi chú
-        # tương ứng trong baidu_downloader.py trên HF Space).
-        shared_paths = api.shared_paths(share_url)
+        # tương ứng trong baidu_downloader.py trên HF Space và trong
+        # _build_full_share_url() ở trên).
+        try:
+            shared_paths = api.shared_paths(full_url)
+        except Exception as exc:  # noqa: BLE001
+            # Bắt RIÊNG lỗi ngay tại lời gọi shared_paths() để luôn log
+            # được RAW exception + phân biệt được CAPTCHA/Cookie hỏng với
+            # các lỗi mạng khác, trước khi lỗi bị "làm phẳng" thành
+            # exception chung ở except ngoài cùng.
+            errno, errmsg = _extract_errno_errmsg(exc)
+            logger.error(
+                "shared_paths(%s) raise exception — errno=%s errmsg=%s raw=%r",
+                full_url, errno, errmsg, exc,
+            )
+            if _looks_like_captcha_or_cookie_issue(exc):
+                raise RuntimeError(
+                    f"shared_paths() lỗi nghi do CAPTCHA/mã xác minh hoặc "
+                    f"Cookie BDUSS/STOKEN đã hết hạn: {exc}"
+                ) from exc
+            raise
+
         logger.debug("RAW shared_paths(): %r", shared_paths)
 
         if not shared_paths:
             errno, errmsg = _extract_errno_errmsg(shared_paths)
             logger.error("shared_paths() trả về rỗng — errno=%s errmsg=%s", errno, errmsg)
+
+            if passcode:
+                error_message = (
+                    f"Link yêu cầu passcode nhưng verify KHÔNG thành công "
+                    f"(đã ghép ?pwd=... vào URL trước khi gọi) — kiểm tra "
+                    f"lại passcode '{passcode}' có đúng không, hoặc link đã "
+                    f"die/hết hạn share. Nếu passcode chắc chắn đúng, khả "
+                    f"năng Cookie BAIDU_BDUSS/BAIDU_STOKEN đã hết hạn — "
+                    f"cần đăng nhập lại Baidu và cập nhật lại 2 secret này."
+                )
+            else:
+                error_message = (
+                    "Danh sách file rỗng, link KHÔNG có passcode — link có "
+                    "thể đã die, đã bị gỡ, hoặc Cookie BAIDU_BDUSS/"
+                    "BAIDU_STOKEN đã hết hạn."
+                )
+
             _send_callback(
                 callback_url, webhook_secret, job_id,
                 {
                     "status": "error",
-                    "error_message": "Danh sách file rỗng — link die/sai passcode/cookie hết hạn.",
+                    "error_message": error_message,
                     "errno": errno,
                     "errmsg": errmsg,
                 },
