@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 Chạy TRONG GitHub Actions (không chạy trên HF Space).
@@ -32,6 +31,31 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 logger = logging.getLogger("resolve_baidu_share")
+
+
+def _log_env_snapshot() -> None:
+    """Log NGAY LẬP TỨC tình trạng có/không của toàn bộ biến môi trường quan
+    trọng — chạy TRƯỚC mọi lệnh _env() bắt buộc, để nếu có lỗi "Thiếu biến
+    môi trường bắt buộc: X" thì log vẫn cho thấy TOÀN CẢNH biến nào có/thiếu
+    trong CÙNG 1 lần chạy, thay vì chỉ báo đúng 1 biến đầu tiên rồi dừng —
+    giúp debug nhanh khi workflow.yml bị thiếu/sai tên key trong `env:`.
+    Giá trị nhạy cảm (BDUSS/STOKEN/secret/token) chỉ log ĐỘ DÀI, không log
+    giá trị thật."""
+    sensitive = {"BAIDU_BDUSS", "BAIDU_STOKEN", "BAIDU_WEBHOOK_SECRET", "HF_TOKEN"}
+    names = [
+        "JOB_ID", "SHARE_URL", "PASSCODE", "DEST_DIR", "CALLBACK_URL",
+        "BAIDU_BDUSS", "BAIDU_STOKEN", "BAIDU_WEBHOOK_SECRET", "HF_TOKEN",
+    ]
+    logger.debug("--- Env snapshot lúc khởi động script ---")
+    for name in names:
+        raw = os.getenv(name, "")
+        if not raw:
+            logger.debug("  %s: (RỖNG/KHÔNG CÓ)", name)
+        elif name in sensitive:
+            logger.debug("  %s: có giá trị (độ dài %d ký tự)", name, len(raw))
+        else:
+            logger.debug("  %s: %r", name, raw)
+    logger.debug("------------------------------------------")
 
 
 def _env(name: str, required: bool = True) -> str:
@@ -117,6 +141,8 @@ def _send_callback(callback_url: str, webhook_secret: str, job_id: str, payload:
 
 
 def main() -> None:
+    _log_env_snapshot()
+
     job_id = _env("JOB_ID")
     share_url = _env("SHARE_URL")
     passcode = _env("PASSCODE", required=False)
