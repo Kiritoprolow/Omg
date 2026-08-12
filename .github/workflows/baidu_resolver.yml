@@ -1,4 +1,3 @@
-
 name: Baidu Pan Resolver
 
 # Được kích hoạt bởi HF Space qua GitHub Repository Dispatch API:
@@ -11,8 +10,7 @@ on:
 jobs:
   resolve:
     runs-on: ubuntu-latest
-    # Chặn timeout job dài quá mức nếu Baidu API bị treo/rate-limit — tránh
-    # tốn phút Actions miễn phí vô ích.
+    # Chặn timeout job dài quá mức nếu Baidu API bị treo/rate-limit
     timeout-minutes: 10
     steps:
       - name: Checkout repo
@@ -21,30 +19,22 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.10"
 
       - name: Cài đặt baidupcs-py + requests
-        run: pip install --upgrade baidupcs-py requests
+        run: |
+          python -m pip install --upgrade pip
+          pip install baidupcs-py requests
 
       - name: Resolve & transfer Baidu share vào Cloud cá nhân
         env:
-          # Cookie đăng nhập Baidu — set ở Settings > Secrets and variables >
-          # Actions của repo này. TUYỆT ĐỐI không hardcode vào code.
           BAIDU_BDUSS: ${{ secrets.BAIDU_BDUSS }}
           BAIDU_STOKEN: ${{ secrets.BAIDU_STOKEN }}
-          # Shared secret để HF Space xác thực webhook đến từ Action thật
-          # (chống giả mạo callback từ bên ngoài).
           BAIDU_WEBHOOK_SECRET: ${{ secrets.BAIDU_WEBHOOK_SECRET }}
-          # HF Space Private yêu cầu HF Token (Authorization: Bearer ...)
-          # để request từ bên ngoài (GitHub Actions) vượt qua lớp xác thực
-          # riêng của HF Spaces trước khi chạm tới webhook /baidu_webhook.
-          # Không bắt buộc nếu Space là Public.
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-          # Toàn bộ giá trị dưới đây đến từ client_payload mà HF Space gửi
-          # kèm request repository_dispatch.
-          JOB_ID: ${{ github.event.client_payload.job_id }}
-          SHARE_URL: ${{ github.event.client_payload.share_url }}
-          PASSCODE: ${{ github.event.client_payload.passcode }}
-          DEST_DIR: ${{ github.event.client_payload.dest_dir }}
-          CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
-        run: python scripts/resolve_baidu_share.py
+        run: |
+          python scripts/resolve_baidu_share.py \
+            '${{ github.event.client_payload.share_url }}' \
+            '${{ github.event.client_payload.callback_url }}' \
+            '${{ github.event.client_payload.job_id }}'
+            
