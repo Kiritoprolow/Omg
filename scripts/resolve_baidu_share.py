@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import logging
+import shutil
 import subprocess
 import requests
 
@@ -10,6 +11,28 @@ logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s [%(levelname)s] %(message)s'
 )
+
+def find_baidupcs_bin() -> str:
+    """Tự động dò tìm file thực thi CLI của baidupcs-py"""
+    py_bin_dir = os.path.dirname(sys.executable)
+    candidates = ["baidupcs-py", "baidupcs", "BaiduPCS-Py", "baidupcs_py"]
+
+    # 1. Kiểm tra ngay trong thư mục bin của Python hiện tại
+    for name in candidates:
+        full_path = os.path.join(py_bin_dir, name)
+        if os.path.exists(full_path):
+            logging.info(f"Đã tìm thấy CLI executable tại: {full_path}")
+            return full_path
+
+    # 2. Kiểm tra trong PATH hệ thống
+    for name in candidates:
+        found = shutil.which(name)
+        if found:
+            logging.info(f"Đã tìm thấy CLI executable qua PATH: {found}")
+            return found
+
+    # Fallback
+    return "baidupcs-py"
 
 def send_callback(callback_url: str, payload: dict, secret: str = None):
     """Gửi HTTP POST webhook callback về HF Space"""
@@ -51,12 +74,15 @@ def main():
         send_callback(callback_url, {"job_id": job_id, "status": "error", "error_message": err_msg}, webhook_secret)
         sys.exit(1)
 
-    # 2. Đăng nhập tài khoản Baidu qua module Python (-m baidupcs_py)
-    login_cmd = [sys.executable, "-m", "baidupcs_py", "login", f"--bduss={bduss}"]
+    # Tìm file thực thi CLI
+    baidupcs_cmd = find_baidupcs_bin()
+
+    # 2. Đăng nhập tài khoản Baidu qua CLI
+    login_cmd = [baidupcs_cmd, "login", f"--bduss={bduss}"]
     if stoken:
         login_cmd.append(f"--stoken={stoken}")
 
-    logging.info("Đang đăng nhập Baidu qua CLI...")
+    logging.info(f"Đang đăng nhập Baidu qua CLI ({baidupcs_cmd})...")
     login_res = subprocess.run(login_cmd, capture_output=True, text=True)
     if login_res.returncode != 0:
         err_msg = f"Đăng nhập Baidu CLI thất bại: {login_res.stderr or login_res.stdout}"
@@ -65,7 +91,7 @@ def main():
         sys.exit(1)
 
     # 3. Gọi lệnh save để lưu file từ link share
-    save_cmd = [sys.executable, "-m", "baidupcs_py", "save", share_url, dest_dir]
+    save_cmd = [baidupcs_cmd, "save", share_url, dest_dir]
     if passcode:
         save_cmd.extend(["-p", passcode])
 
