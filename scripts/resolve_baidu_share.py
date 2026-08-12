@@ -223,7 +223,9 @@ def _call_access_shared(api: BaiduPCSApi, share_url: str, passcode: str) -> Any:
     return access_fn(share_url, passcode)
 
 
-def _call_transfer_shared_paths(api: BaiduPCSApi, dest_dir: str, shared_paths: list[Any]) -> Any:
+def _call_transfer_shared_paths(
+    api: BaiduPCSApi, dest_dir: str, shared_paths: list[Any], share_url: str
+) -> Any:
     """Gọi `api.transfer_shared_paths()` để transfer các path đã share vào
     Cloud cá nhân.
 
@@ -242,8 +244,12 @@ def _call_transfer_shared_paths(api: BaiduPCSApi, dest_dir: str, shared_paths: l
 
     Debug log của lần chạy lỗi cho thấy mỗi phần tử `shared_paths` (kiểu
     `PcsSharedPath`) đã tự mang theo `uk`, `share_id`, `bdstoken`, `fs_id`,
-    `path` — đây chính là các trường mà `transfer_shared_paths()` cần,
-    nên lấy trực tiếp từ đó, không cần gọi thêm API nào khác.
+    `path` — đây chính là phần lớn các trường mà `transfer_shared_paths()`
+    cần, nên lấy trực tiếp từ đó, không cần gọi thêm API nào khác. Riêng
+    tham số `shared_url` (thấy ở run #162, chữ ký thực tế:
+    `['remotedir', 'fs_ids', 'uk', 'share_id', 'bdstoken', 'shared_url']`)
+    không nằm trong object `PcsSharedPath`, nên phải truyền thêm link share
+    gốc vào hàm này.
     """
     transfer_fn = getattr(api, "transfer_shared_paths", None)
     if not callable(transfer_fn):
@@ -292,6 +298,13 @@ def _call_transfer_shared_paths(api: BaiduPCSApi, dest_dir: str, shared_paths: l
             if cand in param_names:
                 kwargs[cand] = bdstoken
                 break
+    # Log thực tế (run #162) cho thấy chữ ký còn có tham số `shared_url`
+    # riêng (khác với danh sách file `fs_ids`) — hàm cần link share gốc,
+    # không chỉ uk/share_id/bdstoken suy ra từ nó.
+    for cand in ("shared_url", "share_url", "url"):
+        if cand in param_names:
+            kwargs[cand] = share_url
+            break
     # Tham số danh sách file cần transfer — thử các tên hay gặp nhất theo
     # thứ tự ưu tiên. Với tên gợi ý "path" thì truyền list path string, với
     # tên gợi ý "fs_id" thì truyền list fs_id, các tên khác (share_list,
@@ -451,7 +464,7 @@ def main() -> None:
         # serialize qua JSON được).
         # ------------------------------------------------------------- #
         try:
-            transfer_result = _call_transfer_shared_paths(api, dest_dir, shared_paths)
+            transfer_result = _call_transfer_shared_paths(api, dest_dir, shared_paths, share_url)
             logger.debug("RAW transfer_shared_paths(): %r", transfer_result)
         except Exception as exc:  # noqa: BLE001
             errno, errmsg = _extract_errno_errmsg(exc)
