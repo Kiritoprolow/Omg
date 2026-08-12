@@ -15,7 +15,7 @@ logging.basicConfig(
 def find_baidupcs_bin() -> str:
     """Tự động dò tìm file thực thi CLI của baidupcs-py"""
     py_bin_dir = os.path.dirname(sys.executable)
-    candidates = ["baidupcs-py", "baidupcs", "BaiduPCS-Py", "baidupcs_py"]
+    candidates = ["BaiduPCS-Py", "baidupcs-py", "baidupcs", "baidupcs_py"]
 
     # 1. Kiểm tra ngay trong thư mục bin của Python hiện tại
     for name in candidates:
@@ -31,8 +31,7 @@ def find_baidupcs_bin() -> str:
             logging.info(f"Đã tìm thấy CLI executable qua PATH: {found}")
             return found
 
-    # Fallback
-    return "baidupcs-py"
+    return "BaiduPCS-Py"
 
 def send_callback(callback_url: str, payload: dict, secret: str = None):
     """Gửi HTTP POST webhook callback về HF Space"""
@@ -77,31 +76,24 @@ def main():
     # Tìm file thực thi CLI
     baidupcs_cmd = find_baidupcs_bin()
 
-    # 2. Đăng nhập tài khoản Baidu qua CLI
-    login_cmd = [baidupcs_cmd, "login", f"--bduss={bduss}"]
+    # 2. Tạo câu lệnh save trực tiếp kèm Cookie BDUSS/STOKEN toàn cục
+    save_cmd = [baidupcs_cmd]
+    if bduss:
+        save_cmd.extend(["--bduss", bduss])
     if stoken:
-        login_cmd.append(f"--stoken={stoken}")
+        save_cmd.extend(["--stoken", stoken])
 
-    logging.info(f"Đang đăng nhập Baidu qua CLI ({baidupcs_cmd})...")
-    login_res = subprocess.run(login_cmd, capture_output=True, text=True)
-    if login_res.returncode != 0:
-        err_msg = f"Đăng nhập Baidu CLI thất bại: {login_res.stderr or login_res.stdout}"
-        logging.error(err_msg)
-        send_callback(callback_url, {"job_id": job_id, "status": "error", "error_message": err_msg}, webhook_secret)
-        sys.exit(1)
-
-    # 3. Gọi lệnh save để lưu file từ link share
-    save_cmd = [baidupcs_cmd, "save", share_url, dest_dir]
+    save_cmd.extend(["save", share_url, dest_dir])
     if passcode:
         save_cmd.extend(["-p", passcode])
 
-    logging.info(f"Thực thi lệnh save: {' '.join(save_cmd)}")
+    logging.info(f"Thực thi lệnh BaiduPCS-Py save...")
     save_res = subprocess.run(save_cmd, capture_output=True, text=True)
 
     output_log = (save_res.stdout or "") + "\n" + (save_res.stderr or "")
-    logging.debug(f"RAW Output từ baidupcs-py:\n{output_log}")
+    logging.debug(f"RAW Output từ BaiduPCS-Py:\n{output_log}")
 
-    # 4. Kiểm tra kết quả và gửi Webhook trả lời HF Space
+    # 3. Kiểm tra kết quả và gửi Webhook trả lời HF Space
     if save_res.returncode == 0:
         logging.info("Lưu file Baidu Share thành công!")
         send_callback(callback_url, {
