@@ -231,22 +231,34 @@ class BaiduDownloadError(Exception):
 def _call_transfer_shared_paths(
     api: BaiduPCSApi, dest_dir: str, entries: list[Any], share_url: str,
 ) -> Any:
-    """Gọi `api.transfer_shared_paths()` với CHỮ KÝ THẬT — đã xác nhận qua
-    TypeError thực tế trên production (KHÔNG phải `(remotedir, *shared_paths)`
-    như suy đoán ở bản trước, cũng KHÔNG phải `(remotedir=, shared_paths=)`):
+    """Gọi `api.transfer_shared_paths()` với CHỮ KÝ THẬT — lần 2 xác nhận qua
+    traceback production đầy đủ (bao gồm cả nội bộ thư viện, không chỉ dòng
+    lỗi TypeError bề mặt). Dòng forward nội bộ trong `api.py`:
+
+        self._baidupcs.transfer_shared_paths(remotedir, fs_ids, uk,
+                                              share_id, bdstoken, shared_url)
+
+    chỉ khớp nếu chữ ký ở TẦNG `BaiduPCSApi` (tầng ta gọi) là:
 
         transfer_shared_paths(self, remotedir, uk, share_id, bdstoken,
-                               shared_url, *fs_ids)
+                               fs_ids, shared_url)
 
-    `uk`/`share_id`/`bdstoken` KHÔNG tự suy ra được — chúng lấy trực tiếp từ
-    field cùng tên có sẵn trên mỗi `PcsSharedPath` (kết quả của
-    `shared_paths()`, xem RAW log). Cả 3 giá trị này GIỐNG NHAU cho mọi entry
-    trong cùng 1 link share (đều mô tả CHÍNH link share đó, không phải riêng
-    từng file/thư mục), nên chỉ cần lấy từ entry đầu tiên. Phần biến đổi theo
-    từng entry là `fs_id` — được truyền RỜI TỪNG CÁI ở cuối qua `*fs_ids`.
+    tức `fs_ids` đứng TRƯỚC `shared_url` (không phải sau như lần sửa trước),
+    và `fs_ids` là 1 LIST duy nhất — KHÔNG unpack bằng `*` (hàm không có
+    `*fs_ids` biến đổi, chỉ có đúng 1 slot `fs_ids` nhận list).
 
-    `shared_url` truyền vào đây PHẢI là share_url gốc (giữ nguyên `?pwd=...`
-    nếu có) — cùng giá trị đã dùng để gọi `shared_paths()`.
+    Bằng chứng lỗi lần trước: gọi `(dest_dir, uk, share_id, bdstoken,
+    share_url, *fs_ids)` với fs_ids=[1 phần tử] đã khiến Python bind NHẦM:
+    slot `fs_ids` nhận chuỗi `share_url`, còn slot `shared_url` nhận SỐ fs_id
+    đơn lẻ — sau đó thư viện dùng `shared_url` để build header `Referer` nên
+    crash với "Header part (<số fs_id>) ... must be of type str or bytes,
+    not <class 'int'>". Đảo đúng thứ tự + bỏ `*` sẽ hết lỗi này.
+
+    `uk`/`share_id`/`bdstoken` lấy từ field cùng tên có sẵn trên mỗi
+    `PcsSharedPath` (kết quả `shared_paths()`) — giống nhau cho mọi entry
+    trong cùng 1 link share, chỉ cần lấy từ entry đầu tiên. `shared_url`
+    PHẢI là share_url GỐC (giữ `?pwd=...` nếu có, cùng giá trị đã dùng gọi
+    `shared_paths()`).
     """
     if not entries:
         raise BaiduDownloadError("Không có entry nào để transfer (danh sách rỗng).")
@@ -272,12 +284,14 @@ def _call_transfer_shared_paths(
 
     logger.debug(
         "Gọi transfer_shared_paths(remotedir=%r, uk=%r, share_id=%r, "
-        "bdstoken=%r..., shared_url=%r, fs_ids=%r)",
+        "bdstoken=%r..., fs_ids=%r, shared_url=%r)",
         dest_dir, uk, share_id,
         (bdstoken[:8] + "...") if isinstance(bdstoken, str) else bdstoken,
-        share_url, fs_ids,
+        fs_ids, share_url,
     )
-    return api.transfer_shared_paths(dest_dir, uk, share_id, bdstoken, share_url, *fs_ids)
+    # QUAN TRỌNG: fs_ids truyền NGUYÊN 1 LIST (không *unpack), và shared_url
+    # là tham số CUỐI CÙNG (không phải ngay sau bdstoken).
+    return api.transfer_shared_paths(dest_dir, uk, share_id, bdstoken, fs_ids, share_url)
 
 
 def _send_callback(callback_url: str, webhook_secret: str, job_id: str, payload: dict) -> None:
