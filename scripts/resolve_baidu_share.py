@@ -1168,6 +1168,58 @@ def _send_callback(callback_url: str, webhook_secret: str, job_id: str, payload:
         logger.error("Gửi callback THẤT BẠI: %s", exc)
 
 
+def _resolve_download_links(api: "BaiduPCSApi", remote_paths: list[str]) -> dict[str, str]:
+    """
+    FIX (log thực tế 13/08/2026): HF Space gọi `api.download_link()` LOCAL
+    để lấy direct-link CDN cho từng file sau khi GH Actions đã transfer xong
+    -> 200/200 file đều lỗi "Không lấy được direct download link" — vì lấy
+    dlink là 1 API call TỚI pan.baidu.com, chạy bằng IP HF Space (chính IP
+    đã bị Baidu chặn, lý do phải proxy TOÀN BỘ thao tác Baidu qua GitHub
+    Actions ngay từ đầu — không riêng gì bước transfer/list).
+
+    Hàm này lấy dlink NGAY TRONG process GitHub Actions (IP không bị chặn),
+    trả về dict {remotepath: dlink_url} qua webhook. HF Space CHỈ còn việc
+    tải bytes bằng `requests` thẳng vào URL CDN đã ký sẵn này (kèm cookie
+    BDUSS/STOKEN) — bản thân URL CDN không bị chặn theo IP (khác domain +
+    khác cơ chế chặn so với API pan.baidu.com), chỉ cần đúng cookie xác
+    thực để CDN chấp nhận request.
+
+    Thử lần lượt vài tên method như `_get_download_url` bên
+    `baidu_downloader.py` — các version baidupcs-py khác nhau đặt tên khác
+    nhau. File nào không lấy được dlink bị BỎ QUA (log WARNING), KHÔNG chặn
+    các file còn lại — HF Space vẫn coi job "success" với các URL lấy được.
+    """
+    download_urls: dict[str, str] = {}
+    for remote_path in remote_paths:
+        url = None
+        for method_name in ("download_link", "download_url", "dlink"):
+            method = getattr(api, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                url = method(remote_path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "api.%s(%s) lỗi khi resolve dlink: %s", method_name, remote_path, exc,
+                )
+                continue
+            if url:
+                break
+        if url:
+            download_urls[remote_path] = url
+        else:
+            logger.warning(
+                "KHÔNG resolve được dlink cho '%s' (đã thử download_link/"
+                "download_url/dlink) — file này sẽ bị BỎ QUA ở HF Space.",
+                remote_path,
+            )
+    logger.info(
+        "Đã resolve dlink cho %d/%d file .mp4 (trong process GH Actions, "
+        "IP không bị chặn).", len(download_urls), len(remote_paths),
+    )
+    return download_urls
+
+
 def main() -> None:
     _log_env_snapshot()
 
@@ -1372,6 +1424,18 @@ def main() -> None:
                 len(saved_paths), dest_dir, drama_id,
             )
 
+        # FIX: resolve dlink NGAY TRONG process GH Actions (xem docstring
+        # `_resolve_download_links`) — file nào không lấy được dlink bị loại
+        # khỏi `saved_paths` cuối cùng luôn, để HF Space không tưởng nhầm là
+        # "đã lưu" nhưng thật ra không có URL để tải.
+        download_urls = _resolve_download_links(api, saved_paths)
+        saved_paths = [p for p in saved_paths if p in download_urls]
+        if not saved_paths:
+            raise BaiduDownloadError(
+                f"Transfer {drama_id} có kết quả nhưng KHÔNG resolve được "
+                "dlink cho BẤT KỲ file nào — kiểm tra log phía trên."
+            )
+
         _send_callback(
             callback_url, webhook_secret, job_id,
             {
@@ -1379,6 +1443,7 @@ def main() -> None:
                 "dest_dir": dest_dir,
                 "drama_id": drama_id,
                 "saved_paths": saved_paths,
+                "download_urls": download_urls,
                 # "partial": True nếu 1 vài batch transfer bị BỎ QUA (soft
                 # fail) — HF Space vẫn xử lý bình thường với saved_paths hiện
                 # có, chỉ là ÍT HƠN tổng số file .mp4 gốc đã tìm thấy.
