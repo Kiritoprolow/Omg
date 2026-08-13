@@ -41,15 +41,12 @@ toàn bộ bước "transfer vào cloud" phải nằm gọn trong GitHub Actions
 
 from __future__ import annotations
 
-import hashlib
 import inspect
 import json
 import logging
 import os
-import random
 import re
 import sys
-from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
@@ -135,53 +132,6 @@ def _entry_path(entry: Any) -> str | None:
     if isinstance(entry, dict):
         return entry.get("path") or entry.get("remotepath")
     return getattr(entry, "path", None) or getattr(entry, "remotepath", None)
-
-
-def _entry_is_dir(entry: Any) -> bool:
-    if isinstance(entry, dict):
-        return bool(entry.get("isdir") or entry.get("is_dir"))
-    is_dir = getattr(entry, "is_dir", None)
-    if is_dir is not None:
-        return bool(is_dir() if callable(is_dir) else is_dir)
-    return bool(getattr(entry, "isdir", False))
-
-
-def _derive_flat_drama_id(share_url: str) -> str:
-    """PHẢI khớp CHÍNH XÁC logic của `baidu_downloader._derive_flat_drama_id`
-    (cùng thuật toán) — vì đây là 2 tiến trình độc lập cùng ghi vào chung 1
-    `processed_dramas.json` phía HF Space, drama_id lệch nhau dù chỉ 1 ký tự
-    sẽ làm hỏng dedup (tưởng bộ phim mới nhưng thật ra đã xử lý rồi)."""
-    clean = share_url.split("?", 1)[0]
-    match = re.search(r"/s/1([A-Za-z0-9_-]+)", clean)
-    if match:
-        return f"flat:{match.group(1)}"
-    return f"flat:{hashlib.md5(clean.encode('utf-8')).hexdigest()[:12]}"
-
-
-def _pick_unprocessed_entry(
-    entries: list[Any], processed_drama_ids: set[str],
-) -> tuple[Any, str]:
-    """Y HỆT `baidu_downloader._pick_unprocessed_entry` — random 1 entry cấp
-    gốc CHƯA có trong processed_drama_ids. Raise ValueError nếu hết (được
-    bắt riêng ở main() để gửi callback status="all_processed" thay vì
-    "error")."""
-    candidates: list[tuple[Any, str]] = []
-    for entry in entries:
-        path = _entry_path(entry)
-        if not path:
-            continue
-        candidates.append((entry, f"folder:{Path(path).name}"))
-
-    if not candidates:
-        raise RuntimeError("shared_paths() trả về entry nhưng không lấy được path nào.")
-
-    unprocessed = [(e, did) for e, did in candidates if did not in processed_drama_ids]
-    if not unprocessed:
-        raise ValueError(
-            f"Đã xử lý HẾT {len(candidates)} Folder bộ phim trong link share này."
-        )
-
-    return random.choice(unprocessed)
 
 
 def _build_full_share_url(share_url: str, passcode: str) -> str:
@@ -273,6 +223,63 @@ def _call_access_shared(api: BaiduPCSApi, share_url: str, passcode: str) -> Any:
     return access_fn(share_url, passcode)
 
 
+class BaiduDownloadError(Exception):
+    """Lỗi phát sinh khi resolve/transfer share Baidu — raise với message rõ
+    ràng để callback trả về error_message hữu ích cho tầng gọi (HF Space)."""
+
+
+def _call_transfer_shared_paths(
+    api: BaiduPCSApi, dest_dir: str, entries: list[Any], share_url: str,
+) -> Any:
+    """Gọi `api.transfer_shared_paths()` với CHỮ KÝ THẬT — đã xác nhận qua
+    TypeError thực tế trên production (KHÔNG phải `(remotedir, *shared_paths)`
+    như suy đoán ở bản trước, cũng KHÔNG phải `(remotedir=, shared_paths=)`):
+
+        transfer_shared_paths(self, remotedir, uk, share_id, bdstoken,
+                               shared_url, *fs_ids)
+
+    `uk`/`share_id`/`bdstoken` KHÔNG tự suy ra được — chúng lấy trực tiếp từ
+    field cùng tên có sẵn trên mỗi `PcsSharedPath` (kết quả của
+    `shared_paths()`, xem RAW log). Cả 3 giá trị này GIỐNG NHAU cho mọi entry
+    trong cùng 1 link share (đều mô tả CHÍNH link share đó, không phải riêng
+    từng file/thư mục), nên chỉ cần lấy từ entry đầu tiên. Phần biến đổi theo
+    từng entry là `fs_id` — được truyền RỜI TỪNG CÁI ở cuối qua `*fs_ids`.
+
+    `shared_url` truyền vào đây PHẢI là share_url gốc (giữ nguyên `?pwd=...`
+    nếu có) — cùng giá trị đã dùng để gọi `shared_paths()`.
+    """
+    if not entries:
+        raise BaiduDownloadError("Không có entry nào để transfer (danh sách rỗng).")
+
+    first = entries[0]
+    uk = getattr(first, "uk", None)
+    share_id = getattr(first, "share_id", None)
+    bdstoken = getattr(first, "bdstoken", None)
+    fs_ids = [getattr(e, "fs_id", None) for e in entries]
+    fs_ids = [f for f in fs_ids if f is not None]
+
+    missing = [
+        name for name, val in (
+            ("uk", uk), ("share_id", share_id), ("bdstoken", bdstoken),
+        ) if val is None
+    ] + (["fs_id (mọi entry đều thiếu)"] if not fs_ids else [])
+    if missing:
+        raise BaiduDownloadError(
+            "Entry trả về từ shared_paths() thiếu field cần thiết để gọi "
+            f"transfer_shared_paths(): {', '.join(missing)} — RAW entry đầu "
+            f"tiên: {first!r}"
+        )
+
+    logger.debug(
+        "Gọi transfer_shared_paths(remotedir=%r, uk=%r, share_id=%r, "
+        "bdstoken=%r..., shared_url=%r, fs_ids=%r)",
+        dest_dir, uk, share_id,
+        (bdstoken[:8] + "...") if isinstance(bdstoken, str) else bdstoken,
+        share_url, fs_ids,
+    )
+    return api.transfer_shared_paths(dest_dir, uk, share_id, bdstoken, share_url, *fs_ids)
+
+
 def _send_callback(callback_url: str, webhook_secret: str, job_id: str, payload: dict) -> None:
     body = {"job_id": job_id, **payload}
     logger.info("Gửi callback về %s: %s", callback_url, json.dumps(body, ensure_ascii=False))
@@ -315,16 +322,6 @@ def main() -> None:
     webhook_secret = _env("BAIDU_WEBHOOK_SECRET")
     bduss = _env("BAIDU_BDUSS")
     stoken = _env("BAIDU_STOKEN", required=False)
-
-    raw_processed_ids = _env("PROCESSED_DRAMA_IDS", required=False)
-    try:
-        processed_drama_ids: set[str] = set(json.loads(raw_processed_ids)) if raw_processed_ids else set()
-    except (json.JSONDecodeError, TypeError):
-        logger.warning(
-            "PROCESSED_DRAMA_IDS không parse được JSON (raw=%r) — coi như rỗng.",
-            raw_processed_ids,
-        )
-        processed_drama_ids = set()
 
     logger.info("Job %s — resolving share_url=%s -> dest_dir=%s", job_id, share_url, dest_dir)
 
@@ -397,46 +394,14 @@ def main() -> None:
             sys.exit(1)
 
         # ------------------------------------------------------------- #
-        # BƯỚC 2.5 — Random né trùng theo Folder bộ phim cấp gốc (PHẢI làm
-        # NGAY ĐÂY, trước transfer — vì đây là process duy nhất thấy được
-        # danh sách entry cấp gốc thật của link share).
-        # ------------------------------------------------------------- #
-        dir_entries = [e for e in shared_paths if _entry_is_dir(e)]
-        try:
-            if dir_entries:
-                chosen_entry, drama_id = _pick_unprocessed_entry(dir_entries, processed_drama_ids)
-                entries_to_transfer = [chosen_entry]
-            else:
-                drama_id = _derive_flat_drama_id(share_url)
-                if drama_id in processed_drama_ids:
-                    raise ValueError(f"Link share (không có Folder con) đã xử lý trước đó: {share_url}")
-                entries_to_transfer = shared_paths
-        except ValueError as exc:
-            logger.info("Tất cả Folder bộ phim đã xử lý hết: %s", exc)
-            _send_callback(
-                callback_url, webhook_secret, job_id,
-                {"status": "all_processed", "error_message": str(exc)},
-            )
-            return
-
-        logger.info(
-            "Đã chọn drama_id=%s (%d entry sẽ transfer)", drama_id, len(entries_to_transfer),
-        )
-
-        # ------------------------------------------------------------- #
         # BƯỚC 3 — transfer_shared_paths() PHẢI chạy cùng process với
         # shared_paths() ở trên (object Python mang uk/shareid, không
-        # serialize qua JSON được). CHỈ transfer entry đã chọn, KHÔNG phải
-        # toàn bộ shared_paths — né lỗi Baidu `130` (quá nhiều item 1 lần)
-        # và tránh rác Folder chưa cần dùng trên Cloud tạm.
+        # serialize qua JSON được). Xem docstring `_call_transfer_shared_paths`
+        # để biết chữ ký thật đã xác nhận qua lỗi thực tế trên production.
         # ------------------------------------------------------------- #
-        # FIX: transfer_shared_paths() KHÔNG nhận keyword arguments remotedir=/
-        # shared_paths= (TypeError: unexpected keyword argument 'shared_paths')
-        # — chữ ký thực tế là positional: (remotedir, *shared_paths). Đây là
-        # lỗi thực tế đã gặp ở dòng này khi chạy qua GitHub Actions.
-        api.transfer_shared_paths(dest_dir, *entries_to_transfer)
+        _call_transfer_shared_paths(api, dest_dir, list(shared_paths), share_url)
 
-        saved_paths = [p for p in (_entry_path(e) for e in entries_to_transfer) if p]
+        saved_paths = [p for p in (_entry_path(e) for e in shared_paths) if p]
         logger.info("Transfer thành công — %d path đã lưu vào %s", len(saved_paths), dest_dir)
 
         _send_callback(
@@ -445,7 +410,6 @@ def main() -> None:
                 "status": "success",
                 "dest_dir": dest_dir,
                 "saved_paths": saved_paths,
-                "drama_id": drama_id,
             },
         )
 
