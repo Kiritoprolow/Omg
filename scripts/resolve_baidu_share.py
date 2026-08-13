@@ -1213,9 +1213,9 @@ def _dump_download_link_diagnostics(api: "BaiduPCSApi") -> None:
 
 
 def _extract_dlink_from_entry(entry: Any) -> "str | None":
-    """1 entry trả về từ method batch-meta (vd `filemetas(...)`) có thể là
-    object (đọc qua attribute) hoặc dict (đọc qua key) tuỳ bản baidupcs-py
-    -> thử cả 2 kiểu, với vài tên field hay gặp."""
+    """1 `PcsFile` trả về từ `api.meta(*remotepaths)` có thể lộ dlink qua
+    vài tên field khác nhau tuỳ bản baidupcs-py (object attribute hoặc dict
+    key) -> thử cả 2 kiểu, với vài tên field hay gặp."""
     for field in ("dlink", "download_url", "downloadurl", "url"):
         val = getattr(entry, field, None) if not isinstance(entry, dict) else entry.get(field)
         if val:
@@ -1224,50 +1224,28 @@ def _extract_dlink_from_entry(entry: Any) -> "str | None":
 
 
 def _resolve_download_links_batch(api: "BaiduPCSApi", remote_paths: list[str]) -> "dict[str, str] | None":
-    """Thử phương án BATCH trước tiên (nhanh hơn nhiều so với gọi từng file):
-    baidupcs-py chính thức dùng `filemetas(remotepaths, dlink=True)` cho
-    lệnh CLI `download` của nó (đọc `.dlink` từ từng PcsFile trả về) — đây
-    là method NHIỀU KHẢ NĂNG đúng nhất, thử TRƯỚC vòng lặp per-file cũ.
-    Trả `None` (không raise) nếu method không tồn tại hoặc gọi lỗi, để tầng
-    gọi tự động rơi xuống fallback per-file."""
-    fn = getattr(api, "filemetas", None)
+    """Thử phương án BATCH trước tiên qua `api.meta(*remotepaths)` — method
+    THẬT SỰ TỒN TẠI trên bản đang cài (xác nhận qua diagnostic dump 13/08/2026:
+    `api.meta(*remotepaths: str) -> List[PcsFile]`). Lưu ý chữ ký dùng
+    *args (variadic), KHÔNG nhận list -> phải gọi `fn(*remote_paths)`, không
+    phải `fn(remote_paths)`.
+
+    Đây chỉ là "may rủi": PcsFile trả về CHƯA CHẮC đã có sẵn field dlink (rất
+    có thể chỉ là metadata thường, dlink phải xin riêng qua
+    `download_link()`) — nếu không entry nào có dlink, trả `None` để tầng
+    gọi rơi xuống fallback per-file bằng `download_link()` (method CHẮC CHẮN
+    đúng theo diagnostic dump)."""
+    fn = getattr(api, "meta", None)
     if not callable(fn):
         return None
     try:
-        sig = inspect.signature(fn)
-        param_names = [
-            p.name for p in sig.parameters.values()
-            if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
-        ]
-    except (TypeError, ValueError):
-        param_names = []
-
-    kwargs: dict[str, Any] = {}
-    mapped_paths_param = False
-    for cand in ("remotepaths", "remote_paths", "paths"):
-        if cand in param_names:
-            kwargs[cand] = remote_paths
-            mapped_paths_param = True
-            break
-    if "dlink" in param_names:
-        kwargs["dlink"] = True
-
-    try:
-        if mapped_paths_param:
-            logger.debug("Thử api.filemetas(**kwargs) với %d path...", len(remote_paths))
-            results = fn(**kwargs)
-        else:
-            logger.debug(
-                "Không map được tham số remotepaths qua introspection cho "
-                "api.filemetas() — fallback gọi theo vị trí (remotepaths, dlink=True)."
-            )
-            results = fn(remote_paths, dlink=True)
+        results = fn(*remote_paths)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("api.filemetas(remotepaths, dlink=True) lỗi: %s", exc)
+        logger.warning("api.meta(*remotepaths) lỗi: %s", exc)
         return None
 
     if not results:
-        logger.warning("api.filemetas(...) trả về rỗng.")
+        logger.warning("api.meta(...) trả về rỗng.")
         return None
 
     download_urls: dict[str, str] = {}
@@ -1279,10 +1257,39 @@ def _resolve_download_links_batch(api: "BaiduPCSApi", remote_paths: list[str]) -
         if url:
             download_urls[path] = url
     logger.info(
-        "[BATCH] api.filemetas(...) trả %d entry -> resolve được %d/%d dlink.",
-        len(results), len(download_urls), len(remote_paths),
+        "[BATCH] api.meta(*remotepaths) trả %d entry -> resolve được %d/%d dlink "
+        "(PcsFile có thể không mang sẵn dlink -> %d còn lại sẽ resolve per-file).",
+        len(results), len(download_urls), len(remote_paths), len(remote_paths) - len(download_urls),
     )
     return download_urls or None
+
+
+def _resolve_single_download_link(api: "BaiduPCSApi", remote_path: str) -> "str | None":
+    """FIX ĐÚNG THEO DIAGNOSTIC DUMP 13/08/2026 (2 lần chạy trước đoán sai
+    tên method / để mặc định `pcs=False` khiến API trả `None` âm thầm,
+    không raise exception nên không log được lý do cụ thể):
+
+        api.download_link(remotepath: str, pcs: bool = False) -> Optional[str]
+
+    Method NÀY đã tồn tại và ĐÃ được gọi ở 2 lần fix trước — nhưng luôn trả
+    `None` với `pcs=False` (mặc định) cho các file vừa `transfer_shared_paths`
+    xong. Giờ thử CẢ 2 giá trị: `pcs=False` trước (giữ hành vi/luồng share
+    API mới), rồi `pcs=True` (luồng PCS API cũ) nếu vẫn `None` — không raise
+    ở tầng này, chỉ trả `None` để tầng gọi tự log."""
+    fn = getattr(api, "download_link", None)
+    if not callable(fn):
+        return None
+    for pcs_flag in (False, True):
+        try:
+            url = fn(remote_path, pcs=pcs_flag)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "api.download_link('%s', pcs=%s) lỗi: %s", remote_path, pcs_flag, exc,
+            )
+            continue
+        if url:
+            return url
+    return None
 
 
 def _resolve_download_links(api: "BaiduPCSApi", remote_paths: list[str]) -> dict[str, str]:
@@ -1301,61 +1308,32 @@ def _resolve_download_links(api: "BaiduPCSApi", remote_paths: list[str]) -> dict
     khác cơ chế chặn so với API pan.baidu.com), chỉ cần đúng cookie xác
     thực để CDN chấp nhận request.
 
-    FIX VÒNG 2 (log 13/08/2026 lần chạy GH Actions đầu tiên sau fix vòng 1):
-    0/200 resolve được — 3 tên đoán ban đầu (download_link/download_url/
-    dlink) KHÔNG TỒN TẠI trên bản baidupcs-py đang cài. Giờ: (1) dump
-    diagnostic 1 lần để biết chắc tên method thật nếu vẫn lỗi; (2) thử
-    BATCH `filemetas(remotepaths, dlink=True)` trước — cách CHÍNH THỨC
-    baidupcs-py dùng cho lệnh CLI `download` của chính nó; (3) fallback về
-    vòng lặp per-file với danh sách tên mở rộng nếu batch không có/lỗi.
+    FIX VÒNG 3 (log 13/08/2026, sau khi diagnostic dump CUỐI CÙNG lộ ra
+    signature thật): API đúng là `api.download_link(remotepath, pcs=False)
+    -> Optional[str]` — vòng 1/2 đoán sai tên (`download_url`/`dlink`/...)
+    HOẶC gọi đúng tên nhưng để mặc định `pcs=False` khiến nó âm thầm trả
+    `None` cho các file vừa transfer xong. Giờ gọi ĐÚNG tên, thử cả
+    `pcs=False` và `pcs=True`. Batch qua `api.meta(*remotepaths)` (method có
+    thật, xác nhận qua diagnostic) được thử trước để tiết kiệm request,
+    nhưng không đảm bảo PcsFile mang sẵn dlink -> luôn có fallback per-file
+    bằng `download_link()` cho phần chưa resolve được.
     """
     _dump_download_link_diagnostics(api)
 
     batch_result = _resolve_download_links_batch(api, remote_paths)
-    if batch_result:
-        missing = [p for p in remote_paths if p not in batch_result]
-        if missing:
-            logger.warning(
-                "[BATCH] %d/%d file KHÔNG có trong kết quả filemetas() — thử "
-                "lại per-file cho riêng %d file này.", len(missing), len(remote_paths), len(missing),
-            )
-        else:
-            logger.info(
-                "Đã resolve dlink cho %d/%d file .mp4 qua BATCH filemetas() "
-                "(trong process GH Actions, IP không bị chặn).",
-                len(batch_result), len(remote_paths),
-            )
-            return batch_result
-    else:
-        missing = remote_paths
-
     download_urls: dict[str, str] = dict(batch_result) if batch_result else {}
-    candidate_names = (
-        "download_link", "download_url", "dlink", "get_download_link",
-        "get_dlink", "download_url_link", "file_download_link",
-    )
+    missing = [p for p in remote_paths if p not in download_urls]
+
     for remote_path in missing:
-        url = None
-        for method_name in candidate_names:
-            method = getattr(api, method_name, None)
-            if not callable(method):
-                continue
-            try:
-                url = method(remote_path)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "api.%s(%s) lỗi khi resolve dlink: %s", method_name, remote_path, exc,
-                )
-                continue
-            if url:
-                break
+        url = _resolve_single_download_link(api, remote_path)
         if url:
             download_urls[remote_path] = url
         else:
             logger.warning(
-                "KHÔNG resolve được dlink cho '%s' (đã thử batch filemetas() + "
-                "%s) — file này sẽ bị BỎ QUA ở HF Space.",
-                remote_path, "/".join(candidate_names),
+                "KHÔNG resolve được dlink cho '%s' (đã thử api.meta() + "
+                "api.download_link(pcs=False/True)) — file này sẽ bị BỎ "
+                "QUA ở HF Space.",
+                remote_path,
             )
     logger.info(
         "Đã resolve dlink cho %d/%d file .mp4 (trong process GH Actions, "
