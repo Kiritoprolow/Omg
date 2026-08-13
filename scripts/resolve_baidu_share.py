@@ -228,6 +228,61 @@ class BaiduDownloadError(Exception):
     ràng để callback trả về error_message hữu ích cho tầng gọi (HF Space)."""
 
 
+def _dump_transfer_shared_paths_source(api: BaiduPCSApi) -> None:
+    """CHẨN ĐOÁN: in ra SOURCE CODE THẬT của `transfer_shared_paths()` ở CẢ 2
+    tầng (BaiduPCSApi.transfer_shared_paths và BaiduPCS.transfer_shared_paths
+    bên dưới nó) — sau 3 lần đoán chữ ký sai theo 3 kiểu khác nhau (thiếu
+    tham số -> sai thứ tự -> giá trị bị hoán vị trong query Baidu trả về
+    "参数错误"), đoán tiếp qua traceback không còn hiệu quả. Hàm này chạy
+    NGAY TRƯỚC khi gọi transfer thật, log ra đúng source + chữ ký của bản
+    baidupcs-py ĐANG CÀI trên runner GitHub Actions — lần chạy tới sẽ biết
+    chính xác 100% cần sửa gì, không đoán mò nữa.
+
+    KHÔNG raise nếu lỗi (chỉ là chẩn đoán phụ trợ, không được chặn luồng
+    chính nếu vì lý do gì đó không lấy được source, vd bản compiled/cython).
+    """
+    logger.info("=" * 70)
+    logger.info("[DIAGNOSTIC] Dump source code thật của transfer_shared_paths()")
+    try:
+        sig_api = inspect.signature(api.transfer_shared_paths)
+        logger.info("[DIAGNOSTIC] BaiduPCSApi.transfer_shared_paths%s", sig_api)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[DIAGNOSTIC] Không lấy được signature ở tầng Api: %s", exc)
+
+    try:
+        src_api = inspect.getsource(api.transfer_shared_paths)
+        logger.info("[DIAGNOSTIC] --- SOURCE tầng Api ---\n%s", src_api)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[DIAGNOSTIC] Không lấy được source ở tầng Api: %s", exc)
+
+    inner = getattr(api, "_baidupcs", None)
+    inner_fn = getattr(inner, "transfer_shared_paths", None) if inner else None
+    if callable(inner_fn):
+        try:
+            sig_inner = inspect.signature(inner_fn)
+            logger.info(
+                "[DIAGNOSTIC] BaiduPCS.transfer_shared_paths%s (tầng dưới)",
+                sig_inner,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[DIAGNOSTIC] Không lấy được signature tầng dưới: %s", exc)
+        try:
+            src_inner = inspect.getsource(inner_fn)
+            logger.info("[DIAGNOSTIC] --- SOURCE tầng dưới (BaiduPCS) ---\n%s", src_inner)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[DIAGNOSTIC] Không lấy được source tầng dưới: %s", exc)
+    else:
+        logger.warning("[DIAGNOSTIC] Không tìm thấy api._baidupcs.transfer_shared_paths.")
+
+    try:
+        import baidupcs_py
+
+        logger.info("[DIAGNOSTIC] baidupcs-py version: %s", getattr(baidupcs_py, "__version__", "?"))
+    except Exception:  # noqa: BLE001
+        pass
+    logger.info("=" * 70)
+
+
 def _call_transfer_shared_paths(
     api: BaiduPCSApi, dest_dir: str, entries: list[Any], share_url: str,
 ) -> Any:
@@ -413,6 +468,7 @@ def main() -> None:
         # serialize qua JSON được). Xem docstring `_call_transfer_shared_paths`
         # để biết chữ ký thật đã xác nhận qua lỗi thực tế trên production.
         # ------------------------------------------------------------- #
+        _dump_transfer_shared_paths_source(api)
         _call_transfer_shared_paths(api, dest_dir, list(shared_paths), share_url)
 
         saved_paths = [p for p in (_entry_path(e) for e in shared_paths) if p]
