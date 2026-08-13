@@ -51,5 +51,9 @@ jobs:
           PASSCODE: ${{ github.event.client_payload.passcode }}
           DEST_DIR: ${{ github.event.client_payload.dest_dir }}
           CALLBACK_URL: ${{ github.event.client_payload.callback_url }}
+          # Danh sách drama_id đã xử lý (mảng JSON) để script tự random né
+          # trùng theo Folder bộ phim cấp gốc TRƯỚC khi transfer — dùng
+          # toJSON() tường minh để luôn ra đúng chuỗi JSON hợp lệ dù
+          # client_payload gửi mảng rỗng [] hay có phần tử.
+          PROCESSED_DRAMA_IDS: ${{ toJSON(github.event.client_payload.processed_drama_ids) }}
         run: python scripts/resolve_baidu_share.py
-        
