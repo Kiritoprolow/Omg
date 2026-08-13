@@ -57,6 +57,26 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 import requests
 from baidupcs_py.baidupcs import BaiduPCSApi
 
+# BaiduPCSError — exception gốc mà baidupcs-py raise ra cho MỌI lỗi API trả
+# về (errno/error_code != 0, vd: error_code=4 "存储好像出问题了" — kho lưu
+# trữ tạm thời gặp sự cố phía Baidu). Vị trí import thay đổi tuỳ version thư
+# viện nên thử lần lượt vài chỗ phổ biến nhất; nếu không tìm thấy ở đâu cả,
+# fallback về 1 class rỗng kế thừa Exception để `except (..., BaiduPCSError)`
+# vẫn chạy được (không isinstance-match được gì thêm ngoài các nhánh check
+# errno/message thủ công vốn đã có sẵn bên dưới) thay vì crash ngay lúc import.
+try:
+    from baidupcs_py.common.errors import BaiduPCSError
+except ImportError:
+    try:
+        from baidupcs_py.baidupcs.errors import BaiduPCSError  # type: ignore[no-redef]
+    except ImportError:
+        try:
+            from baidupcs_py.errors import BaiduPCSError  # type: ignore[no-redef]
+        except ImportError:
+            class BaiduPCSError(Exception):  # type: ignore[no-redef]
+                """Fallback rỗng khi không tìm thấy BaiduPCSError thật ở bất kỳ
+                vị trí import nào đã thử — xem comment phía trên."""
+
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -580,6 +600,18 @@ class BaiduDownloadError(Exception):
 BAIDU_TRANSFER_BATCH_SIZE = 12  # tối đa 10-15 fs_id/batch theo yêu cầu
 BAIDU_TRANSFER_BATCH_SLEEP_SECONDS = 1.0  # nghỉ giữa các batch để né rate limit
 BAIDU_TRANSFER_MAX_RETRIES = 3  # số lần thử tối đa/batch khi lỗi mạng/504/JSONDecodeError
+# FIX (log thực tế 13/08/2026 cho thấy error_code=4 dính LIÊN TIẾP CẢ 3 lần
+# thử ở NHIỀU link/batch khác nhau, khiến job chết hẳn thay vì tự hồi phục
+# "sau vài giây" như kỳ vọng ban đầu): error_code=4 giờ có RIÊNG 1 ngân sách
+# retry độc lập với BAIDU_TRANSFER_MAX_RETRIES (dùng cho lỗi mạng/504), có
+# exponential backoff thay vì nghỉ cố định — vì thực tế cho thấy 2 giây là
+# QUÁ NGẮN, sự cố lưu trữ phía Baidu nhiều khi cần vài chục giây mới hồi.
+BAIDU_ERROR_CODE_4_MAX_RETRIES = 6
+BAIDU_ERROR_CODE_4_BASE_SLEEP_SECONDS = 5.0  # backoff: 5s,10s,20s,40s,60s,60s
+BAIDU_ERROR_CODE_4_MAX_SLEEP_SECONDS = 60.0
+# Giữ hằng số cũ (không dùng nữa ở nhánh error_code=4) để không phá vỡ chỗ
+# nào khác lỡ còn tham chiếu tới tên biến này.
+BAIDU_ERROR_CODE_4_RETRY_SLEEP_SECONDS = BAIDU_ERROR_CODE_4_BASE_SLEEP_SECONDS
 
 # Cụm từ nhận diện lỗi CÓ THỂ retry được (mạng chập chờn/Baidu quá tải khi
 # batch vẫn còn hơi to) — KHÔNG bao gồm lỗi tham số sai/hết dung lượng/token
@@ -624,6 +656,28 @@ def _is_error_code_2(exc: Exception) -> bool:
     return "参数错误" in msg
 
 
+def _is_error_code_4(exc: Exception) -> bool:
+    """Nhận diện lỗi Baidu trả về `error_code`/`errno` = 4 (`存储好像出问题了`
+    — "kho lưu trữ dường như đang gặp sự cố"). KHÁC với `error_code=2` (tham
+    số/1 fs_id cụ thể bị hỏng, KHÔNG đáng retry nguyên batch): lỗi 4 là sự cố
+    TẠM THỜI phía hạ tầng lưu trữ Baidu, ảnh hưởng cả batch nhưng thường tự
+    hết sau vài giây — ĐÁNG để retry lại NGUYÊN batch (không cần tách lẻ
+    fs_id như error_code=2)."""
+    errno, _errmsg = _extract_errno_errmsg(exc)
+    if errno is not None:
+        try:
+            if int(errno) == 4:
+                return True
+        except (TypeError, ValueError):
+            pass
+    msg = str(exc)
+    if re.search(r"error_code[\"']?\s*[:=]\s*4\b", msg, re.IGNORECASE):
+        return True
+    if re.search(r"\berrno[\"']?\s*[:=]\s*4\b", msg, re.IGNORECASE):
+        return True
+    return "存储好像出问题了" in msg
+
+
 def _transfer_fs_ids_individually(
     api: BaiduPCSApi,
     dest_dir: str,
@@ -634,7 +688,7 @@ def _transfer_fs_ids_individually(
     share_url: str,
     batch_index: int,
     total_batches: int,
-) -> list[Any]:
+) -> tuple[list[Any], list[Any]]:
     """FALLBACK khi cả 1 batch bị Baidu từ chối với `error_code=2` (`参数错误`)
     — thường do 1 (vài) `fs_id` CỤ THỂ trong batch bị hỏng/đã bị xoá khỏi
     share/không còn hợp lệ, KHÔNG phải lỗi của toàn bộ batch. Thay vì để 1
@@ -642,7 +696,11 @@ def _transfer_fs_ids_individually(
     `fs_id` RIÊNG LẺ — `fs_id` nào tiếp tục dính `error_code=2` sẽ bị BỎ QUA
     (log WARNING, KHÔNG raise), các file `.mp4` còn lại trong bộ vẫn được
     transfer bình thường. Chỉ raise nếu TẤT CẢ `fs_id` lẻ trong batch đều
-    thất bại (không transfer thành công được file nào)."""
+    thất bại (không transfer thành công được file nào).
+
+    Trả về `(results, skipped_fs_ids)` — `skipped_fs_ids` để caller lọc
+    CHÍNH XÁC những entry nào THẬT SỰ transfer thành công (dùng cho
+    `saved_paths` trong callback, tránh báo về file chưa hề nằm trên Cloud)."""
     results: list[Any] = []
     skipped: list[Any] = []
     for fs_id in fs_ids:
@@ -655,8 +713,16 @@ def _transfer_fs_ids_individually(
                 results.append(result)
                 last_exc = None
                 break
-            except Exception as exc:  # noqa: BLE001 - cần bắt mọi lỗi để quyết định skip/retry
+            except (BaiduPCSError, requests.RequestException, json.JSONDecodeError, Exception) as exc:  # noqa: BLE001 - cần bắt mọi lỗi (kể cả BaiduPCSError) để quyết định skip/retry
                 last_exc = exc
+                if _is_error_code_4(exc):
+                    # error_code=4 (存储好像出问题了) -> sự cố lưu trữ TẠM
+                    # THỜI phía Baidu -> retry lại fs_id lẻ này, nghỉ RIÊNG
+                    # BAIDU_ERROR_CODE_4_RETRY_SLEEP_SECONDS giây.
+                    if attempt >= BAIDU_TRANSFER_MAX_RETRIES:
+                        break
+                    time.sleep(BAIDU_ERROR_CODE_4_RETRY_SLEEP_SECONDS)
+                    continue
                 if _is_error_code_2(exc):
                     # error_code=2 ở file LẺ -> gần như chắc chắn CHÍNH file
                     # này hỏng/đã bị xoá khỏi share -> KHÔNG phải lỗi tạm
@@ -696,7 +762,7 @@ def _transfer_fs_ids_individually(
             batch_index, total_batches, len(fs_ids),
         )
 
-    return results
+    return results, skipped
 
 
 def _dump_transfer_shared_paths_source(api: BaiduPCSApi) -> None:
@@ -763,7 +829,7 @@ def _call_transfer_shared_paths(
     uk_override: Any = None,
     share_id_override: Any = None,
     bdstoken_override: Any = None,
-) -> Any:
+) -> tuple[list[Any], set[Any]]:
     """Gọi `api.transfer_shared_paths()` với CHỮ KÝ THẬT — lần 3 xác nhận,
     lần này đối chiếu TRỰC TIẾP với `inspect.getsource()` dump tại runtime
     (xem `_dump_transfer_shared_paths_source`), tức đọc thẳng source code
@@ -801,9 +867,15 @@ def _call_transfer_shared_paths(
     limit). Mỗi batch tự retry tối đa `BAIDU_TRANSFER_MAX_RETRIES` lần nếu
     dính lỗi mạng/504/JSONDecodeError (`_is_retryable_transfer_error`) —
     lỗi không thuộc nhóm này (vd sai tham số, hết dung lượng, token hết
-    hạn) sẽ raise NGAY, không retry vô ích. CHỈ coi là thành công nếu TẤT CẢ
-    batch đều transfer xong; 1 batch lỗi (sau khi hết retry) sẽ raise ngay
-    lập tức, không âm thầm bỏ qua phần còn lại.
+    hạn) sẽ raise NGAY, không retry vô ích.
+
+    BATCH ISOLATION (soft-fail): nếu 1 batch retry hết
+    `BAIDU_TRANSFER_MAX_RETRIES` lần vẫn lỗi (vd file bị Baidu khoá/lỗi lưu
+    trữ không tự hồi phục), hàm này KHÔNG raise chết cả quá trình — log
+    ERROR, BỎ QUA (skip) batch hỏng đó, rồi TIẾP TỤC transfer các batch còn
+    lại. CHỈ raise `BaiduDownloadError` nếu TẤT CẢ batch đều thất bại (không
+    có file nào transfer thành công) — chỉ cần ÍT NHẤT 1 batch thành công là
+    coi như có kết quả để tiếp tục xử lý.
 
     FALLBACK RIÊNG cho `error_code=2` (`参数错误`, xem `_is_error_code_2`):
     lỗi này thường do 1 fs_id CỤ THỂ trong batch bị hỏng/đã bị xoá khỏi
@@ -811,6 +883,18 @@ def _call_transfer_shared_paths(
     TÁCH RA transfer từng fs_id lẻ (`_transfer_fs_ids_individually`), fs_id
     nào tiếp tục lỗi 2 thì log WARNING bỏ qua, các file .mp4 còn lại trong
     bộ vẫn transfer bình thường.
+
+    RETRY RIÊNG cho `error_code=4` (`存储好像出问题了`, xem `_is_error_code_4`):
+    sự cố lưu trữ TẠM THỜI phía hạ tầng Baidu (bao gồm cả `BaiduPCSError` do
+    baidupcs-py raise ra) — retry lại NGUYÊN batch, nghỉ
+    `BAIDU_ERROR_CODE_4_RETRY_SLEEP_SECONDS` giây giữa các lần thử, đủ
+    `BAIDU_TRANSFER_MAX_RETRIES` lần trước khi coi batch đó là hỏng và
+    chuyển qua cơ chế BATCH ISOLATION ở trên.
+
+    Trả về `(results, skipped_fs_ids)` — `skipped_fs_ids` (set) chứa TẤT CẢ
+    fs_id KHÔNG transfer thành công (do batch bị skip hoặc do fallback tách
+    lẻ vẫn lỗi), để caller lọc CHÍNH XÁC `saved_paths` báo về callback, tránh
+    báo nhầm file chưa hề thực sự nằm trên Cloud cá nhân.
     """
     if not entries:
         raise BaiduDownloadError("Không có entry nào để transfer (danh sách rỗng).")
@@ -877,9 +961,21 @@ def _call_transfer_shared_paths(
     # runtime) là remotedir, fs_ids, uk, share_id, bdstoken, shared_url.
     # fs_ids của MỖI BATCH vẫn truyền NGUYÊN 1 LIST (không *unpack).
     results: list[Any] = []
+    # BATCH ISOLATION: batch nào retry hết BAIDU_TRANSFER_MAX_RETRIES lần vẫn
+    # lỗi (không phục hồi được, vd error_code=4 dai dẳng) sẽ bị BỎ QUA — gom
+    # TOÀN BỘ fs_id KHÔNG transfer thành công vào đây (dù do skip nguyên batch
+    # hay do fallback tách lẻ vẫn lỗi 1 phần), để caller lọc đúng saved_paths.
+    skipped_fs_ids: set[Any] = set()
     for batch_index, batch_fs_ids in enumerate(batches, start=1):
         last_exc: Exception | None = None
-        for attempt in range(1, BAIDU_TRANSFER_MAX_RETRIES + 1):
+        # Ngân sách retry RIÊNG cho error_code=4 (exponential backoff, độc
+        # lập với BAIDU_TRANSFER_MAX_RETRIES) — track ở NGOÀI vòng attempt
+        # chính để 1 batch có thể "chuyển làn" từ lỗi-4 sang lỗi-khác (hoặc
+        # ngược lại) mà không bị tính trùng/tính thiếu lượt thử.
+        error_code_4_attempt = 0
+        attempt = 0
+        while attempt < BAIDU_TRANSFER_MAX_RETRIES:
+            attempt += 1
             try:
                 logger.debug(
                     "Batch %d/%d (lần thử %d/%d) — transfer_shared_paths(remotedir=%r, "
@@ -900,8 +996,46 @@ def _call_transfer_shared_paths(
                 )
                 last_exc = None
                 break
-            except Exception as exc:  # noqa: BLE001 - cần bắt mọi lỗi để quyết định retry
+            # Bắt rõ cả BaiduPCSError (lỗi API gốc từ baidupcs-py, vd
+            # error_code=4 "存储好像出问题了") thay vì chỉ trông chờ except
+            # Exception chung chung — để nhánh retry-thật-sự cho error_code=4
+            # luôn được xét TRƯỚC, không lọt xuống nhánh "không retry được".
+            except (BaiduPCSError, requests.RequestException, json.JSONDecodeError, Exception) as exc:  # noqa: BLE001 - cần bắt mọi lỗi để quyết định retry
                 last_exc = exc
+                if _is_error_code_4(exc):
+                    # FIX: error_code=4 (存储好像出问题了) giờ dùng ngân sách
+                    # retry RIÊNG (BAIDU_ERROR_CODE_4_MAX_RETRIES lần, backoff
+                    # tăng dần 5s/10s/20s/40s/60s/60s) thay vì ăn chung 3 lần
+                    # với lỗi mạng — log thực tế cho thấy 2s x 3 lần LÀ QUÁ
+                    # NGẮN để sự cố lưu trữ phía Baidu tự hồi, khiến batch
+                    # (và cả link) chết oan dù lỗi này vốn tạm thời.
+                    error_code_4_attempt += 1
+                    if error_code_4_attempt >= BAIDU_ERROR_CODE_4_MAX_RETRIES:
+                        logger.warning(
+                            "Batch %d/%d dính error_code=4 (存储好像出问题了) "
+                            "đã retry đủ %d/%d lần (ngân sách riêng) vẫn lỗi "
+                            "— sẽ ghi nhận batch này THẤT BẠI (BỎ QUA): %s",
+                            batch_index, len(batches), error_code_4_attempt,
+                            BAIDU_ERROR_CODE_4_MAX_RETRIES, exc,
+                        )
+                        break
+                    sleep_sec = min(
+                        BAIDU_ERROR_CODE_4_BASE_SLEEP_SECONDS * (2 ** (error_code_4_attempt - 1)),
+                        BAIDU_ERROR_CODE_4_MAX_SLEEP_SECONDS,
+                    )
+                    logger.warning(
+                        "Batch %d/%d dính error_code=4 (存储好像出问题了 — lỗi "
+                        "lưu trữ tạm thời phía Baidu, lần thử %d/%d riêng cho "
+                        "lỗi này) — nghỉ %.1fs rồi retry nguyên batch: %s",
+                        batch_index, len(batches), error_code_4_attempt,
+                        BAIDU_ERROR_CODE_4_MAX_RETRIES, sleep_sec, exc,
+                    )
+                    time.sleep(sleep_sec)
+                    # KHÔNG tính vào ngân sách `attempt` của vòng lặp chính
+                    # (chỉ dành cho lỗi mạng/504/JSONDecodeError) -> lùi lại,
+                    # để error_code=4 có ngân sách retry hoàn toàn riêng.
+                    attempt -= 1
+                    continue
                 if _is_error_code_2(exc):
                     # error_code=2 (参数错误) -> thường do 1 fs_id CỤ THỂ
                     # trong batch bị hỏng/không hợp lệ, KHÔNG phải lỗi mạng
@@ -937,27 +1071,70 @@ def _call_transfer_shared_paths(
                 # FALLBACK: batch lỗi error_code=2 -> tách lẻ, transfer từng
                 # fs_id — file nào tiếp tục lỗi 2 thì bỏ qua (log WARNING),
                 # KHÔNG chặn cả batch/cả bộ phim vì 1 file hỏng.
-                batch_result = _transfer_fs_ids_individually(
-                    api, dest_dir, batch_fs_ids, uk, share_id, bdstoken, share_url,
-                    batch_index, len(batches),
-                )
-                results.append(batch_result)
+                try:
+                    batch_result, ind_skipped = _transfer_fs_ids_individually(
+                        api, dest_dir, batch_fs_ids, uk, share_id, bdstoken, share_url,
+                        batch_index, len(batches),
+                    )
+                    results.append(batch_result)
+                    skipped_fs_ids.update(ind_skipped)
+                except BaiduDownloadError as fallback_exc:
+                    # TẤT CẢ fs_id lẻ trong batch đều thất bại -> BATCH
+                    # ISOLATION: log ERROR + BỎ QUA nguyên batch này, KHÔNG
+                    # raise chết cả workflow, tiếp tục các batch còn lại.
+                    skipped_fs_ids.update(batch_fs_ids)
+                    logger.error(
+                        "Batch %d/%d: fallback tách lẻ fs_id CŨNG thất bại "
+                        "hoàn toàn — BỎ QUA (skip) toàn bộ batch này, TIẾP "
+                        "TỤC transfer các batch còn lại: %s",
+                        batch_index, len(batches), fallback_exc,
+                    )
             else:
-                raise BaiduDownloadError(
-                    f"Batch {batch_index}/{len(batches)} ({len(batch_fs_ids)} fs_id) "
-                    f"transfer thất bại sau {BAIDU_TRANSFER_MAX_RETRIES} lần thử: {last_exc}"
-                ) from last_exc
+                # BATCH ISOLATION (soft-fail): batch đã retry hết
+                # BAIDU_TRANSFER_MAX_RETRIES lần (bao gồm cả nhánh
+                # error_code=4 ở trên) vẫn lỗi -> log ERROR + BỎ QUA batch
+                # hỏng này, KHÔNG raise làm crash toàn bộ workflow — tiếp tục
+                # các batch kế tiếp, fs_id của batch này đơn giản sẽ thiếu
+                # trong `saved_paths` cuối cùng thay vì làm mất TẤT CẢ.
+                skipped_fs_ids.update(batch_fs_ids)
+                logger.error(
+                    "Batch %d/%d (%d fs_id) transfer THẤT BẠI sau %d lần thử "
+                    "— BỎ QUA (skip) batch lỗi này (có thể do file bị Baidu "
+                    "khoá/lỗi lưu trữ không tự hồi phục), TIẾP TỤC transfer "
+                    "các batch còn lại: %s",
+                    batch_index, len(batches), len(batch_fs_ids),
+                    BAIDU_TRANSFER_MAX_RETRIES, last_exc,
+                )
 
         # Nghỉ giữa các batch (kể cả sau batch cuối thì không cần) để né rate
         # limit — Baidu dễ trả 504 nếu request dồn dập liên tục.
         if batch_index < len(batches):
             time.sleep(BAIDU_TRANSFER_BATCH_SLEEP_SECONDS)
 
-    logger.info(
-        "TẤT CẢ %d batch (%d fs_id) đã transfer thành công vào %s.",
-        len(batches), len(fs_ids), dest_dir,
-    )
-    return results
+    if skipped_fs_ids:
+        logger.warning(
+            "Hoàn tất transfer: %d/%d fs_id THÀNH CÔNG, %d fs_id BỊ BỎ QUA "
+            "(lỗi không phục hồi được sau %d lần thử/batch) vào %s.",
+            len(fs_ids) - len(skipped_fs_ids), len(fs_ids), len(skipped_fs_ids),
+            BAIDU_TRANSFER_MAX_RETRIES, dest_dir,
+        )
+    else:
+        logger.info(
+            "TẤT CẢ %d batch (%d fs_id) đã transfer thành công vào %s.",
+            len(batches), len(fs_ids), dest_dir,
+        )
+
+    if not results:
+        # KHÔNG batch nào transfer thành công -> thật sự không có gì để tiếp
+        # tục -> raise để tầng gọi biết job thất bại hoàn toàn (khác với "1
+        # vài batch lỗi nhưng vẫn còn kết quả" ở trên, vốn KHÔNG raise nữa).
+        raise BaiduDownloadError(
+            f"TẤT CẢ {len(batches)} batch ({len(fs_ids)} fs_id) đều transfer "
+            f"thất bại vào {dest_dir} — không có file nào được transfer "
+            f"thành công (xem log ERROR phía trên để biết lý do từng batch)."
+        )
+
+    return results, skipped_fs_ids
 
 
 def _send_callback(callback_url: str, webhook_secret: str, job_id: str, payload: dict) -> None:
@@ -1167,16 +1344,33 @@ def main() -> None:
         # nhận qua lỗi thực tế trên production.
         # ------------------------------------------------------------- #
         _dump_transfer_shared_paths_source(api)
-        _call_transfer_shared_paths(
+        _transfer_results, skipped_fs_ids = _call_transfer_shared_paths(
             api, dest_dir, mp4_entries, share_url,
             uk_override=root_uk, share_id_override=root_share_id, bdstoken_override=root_bdstoken,
         )
 
-        saved_paths = [p for p in (_entry_path(e) for e in mp4_entries) if p]
-        logger.info(
-            "Transfer thành công — %d file .mp4 đã lưu vào %s (drama_id=%s)",
-            len(saved_paths), dest_dir, drama_id,
-        )
+        # CHỈ tính là "đã lưu" (saved_paths) những entry KHÔNG nằm trong
+        # skipped_fs_ids — đảm bảo callback KHÔNG bao giờ báo về 1 file thực
+        # ra chưa hề transfer thành công lên Cloud (do batch của nó bị BỎ QUA
+        # sau khi retry hết BAIDU_TRANSFER_MAX_RETRIES lần, xem BATCH
+        # ISOLATION trong `_call_transfer_shared_paths`).
+        transferred_entries = [
+            e for e in mp4_entries if getattr(e, "fs_id", None) not in skipped_fs_ids
+        ]
+        saved_paths = [p for p in (_entry_path(e) for e in transferred_entries) if p]
+        if skipped_fs_ids:
+            logger.warning(
+                "Transfer THÀNH CÔNG MỘT PHẦN — %d/%d file .mp4 đã lưu vào %s "
+                "(drama_id=%s), %d file bị BỎ QUA do batch transfer lỗi (xem "
+                "log ERROR phía trên để biết batch nào).",
+                len(saved_paths), len(mp4_entries), dest_dir, drama_id,
+                len(mp4_entries) - len(saved_paths),
+            )
+        else:
+            logger.info(
+                "Transfer thành công — %d file .mp4 đã lưu vào %s (drama_id=%s)",
+                len(saved_paths), dest_dir, drama_id,
+            )
 
         _send_callback(
             callback_url, webhook_secret, job_id,
@@ -1185,6 +1379,10 @@ def main() -> None:
                 "dest_dir": dest_dir,
                 "drama_id": drama_id,
                 "saved_paths": saved_paths,
+                # "partial": True nếu 1 vài batch transfer bị BỎ QUA (soft
+                # fail) — HF Space vẫn xử lý bình thường với saved_paths hiện
+                # có, chỉ là ÍT HƠN tổng số file .mp4 gốc đã tìm thấy.
+                "partial": bool(skipped_fs_ids),
             },
         )
 
