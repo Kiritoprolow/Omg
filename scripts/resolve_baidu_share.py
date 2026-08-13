@@ -286,28 +286,27 @@ def _dump_transfer_shared_paths_source(api: BaiduPCSApi) -> None:
 def _call_transfer_shared_paths(
     api: BaiduPCSApi, dest_dir: str, entries: list[Any], share_url: str,
 ) -> Any:
-    """Gọi `api.transfer_shared_paths()` với CHỮ KÝ THẬT — lần 2 xác nhận qua
-    traceback production đầy đủ (bao gồm cả nội bộ thư viện, không chỉ dòng
-    lỗi TypeError bề mặt). Dòng forward nội bộ trong `api.py`:
+    """Gọi `api.transfer_shared_paths()` với CHỮ KÝ THẬT — lần 3 xác nhận,
+    lần này đối chiếu TRỰC TIẾP với `inspect.getsource()` dump tại runtime
+    (xem `_dump_transfer_shared_paths_source`), tức đọc thẳng source code
+    thật đang chạy trên máy CI chứ không suy đoán qua dòng forward nội bộ
+    nữa. Dump đó cho ra CHỮ KÝ THẬT của tầng `BaiduPCSApi`:
 
-        self._baidupcs.transfer_shared_paths(remotedir, fs_ids, uk,
-                                              share_id, bdstoken, shared_url)
+        def transfer_shared_paths(self, remotedir, fs_ids, uk, share_id,
+                                   bdstoken, shared_url): ...
 
-    chỉ khớp nếu chữ ký ở TẦNG `BaiduPCSApi` (tầng ta gọi) là:
-
-        transfer_shared_paths(self, remotedir, uk, share_id, bdstoken,
-                               fs_ids, shared_url)
-
-    tức `fs_ids` đứng TRƯỚC `shared_url` (không phải sau như lần sửa trước),
-    và `fs_ids` là 1 LIST duy nhất — KHÔNG unpack bằng `*` (hàm không có
-    `*fs_ids` biến đổi, chỉ có đúng 1 slot `fs_ids` nhận list).
-
-    Bằng chứng lỗi lần trước: gọi `(dest_dir, uk, share_id, bdstoken,
-    share_url, *fs_ids)` với fs_ids=[1 phần tử] đã khiến Python bind NHẦM:
-    slot `fs_ids` nhận chuỗi `share_url`, còn slot `shared_url` nhận SỐ fs_id
-    đơn lẻ — sau đó thư viện dùng `shared_url` để build header `Referer` nên
-    crash với "Header part (<số fs_id>) ... must be of type str or bytes,
-    not <class 'int'>". Đảo đúng thứ tự + bỏ `*` sẽ hết lỗi này.
+    tức thứ tự đúng là remotedir, fs_ids, uk, share_id, bdstoken, shared_url
+    — `fs_ids` đứng NGAY SAU `remotedir`, KHÔNG phải trước `shared_url` như
+    lần sửa trước suy đoán nhầm (lần đó suy từ dòng forward nội bộ
+    `self._baidupcs.transfer_shared_paths(remotedir, fs_ids, uk, share_id,
+    bdstoken, shared_url)`, nhưng dòng forward đó chỉ nói tầng dưới nhận gì
+    theo tên biến cục bộ — KHÔNG chứng minh được thứ tự tham số của CHÍNH
+    hàm tầng `BaiduPCSApi`). Gọi sai thứ tự khiến giá trị `uk` (một int) bị
+    truyền nhầm vào slot `fs_ids`, nên `dump_json(fs_ids)` serialize ra một
+    số đơn lẻ thay vì list `[fs_id, ...]` -> Baidu trả lỗi
+    `errno=2, message=参数错误` (tham số không hợp lệ). `fs_ids` vẫn là 1 LIST
+    duy nhất — KHÔNG unpack bằng `*` (hàm không có `*fs_ids` biến đổi, chỉ
+    có đúng 1 slot `fs_ids` nhận list).
 
     `uk`/`share_id`/`bdstoken` lấy từ field cùng tên có sẵn trên mỗi
     `PcsSharedPath` (kết quả `shared_paths()`) — giống nhau cho mọi entry
@@ -338,15 +337,16 @@ def _call_transfer_shared_paths(
         )
 
     logger.debug(
-        "Gọi transfer_shared_paths(remotedir=%r, uk=%r, share_id=%r, "
-        "bdstoken=%r..., fs_ids=%r, shared_url=%r)",
-        dest_dir, uk, share_id,
+        "Gọi transfer_shared_paths(remotedir=%r, fs_ids=%r, uk=%r, "
+        "share_id=%r, bdstoken=%r..., shared_url=%r)",
+        dest_dir, fs_ids, uk, share_id,
         (bdstoken[:8] + "...") if isinstance(bdstoken, str) else bdstoken,
-        fs_ids, share_url,
+        share_url,
     )
-    # QUAN TRỌNG: fs_ids truyền NGUYÊN 1 LIST (không *unpack), và shared_url
-    # là tham số CUỐI CÙNG (không phải ngay sau bdstoken).
-    return api.transfer_shared_paths(dest_dir, uk, share_id, bdstoken, fs_ids, share_url)
+    # QUAN TRỌNG: thứ tự đúng (đối chiếu inspect.getsource() dump tại
+    # runtime) là remotedir, fs_ids, uk, share_id, bdstoken, shared_url.
+    # fs_ids truyền NGUYÊN 1 LIST (không *unpack), đứng NGAY SAU remotedir.
+    return api.transfer_shared_paths(dest_dir, fs_ids, uk, share_id, bdstoken, share_url)
 
 
 def _send_callback(callback_url: str, webhook_secret: str, job_id: str, payload: dict) -> None:
