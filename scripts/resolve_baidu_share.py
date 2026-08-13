@@ -430,7 +430,11 @@ def main() -> None:
         # toàn bộ shared_paths — né lỗi Baidu `130` (quá nhiều item 1 lần)
         # và tránh rác Folder chưa cần dùng trên Cloud tạm.
         # ------------------------------------------------------------- #
-        api.transfer_shared_paths(remotedir=dest_dir, shared_paths=entries_to_transfer)
+        # FIX: transfer_shared_paths() KHÔNG nhận keyword arguments remotedir=/
+        # shared_paths= (TypeError: unexpected keyword argument 'shared_paths')
+        # — chữ ký thực tế là positional: (remotedir, *shared_paths). Đây là
+        # lỗi thực tế đã gặp ở dòng này khi chạy qua GitHub Actions.
+        api.transfer_shared_paths(dest_dir, *entries_to_transfer)
 
         saved_paths = [p for p in (_entry_path(e) for e in entries_to_transfer) if p]
         logger.info("Transfer thành công — %d path đã lưu vào %s", len(saved_paths), dest_dir)
