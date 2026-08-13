@@ -41,12 +41,15 @@ toàn bộ bước "transfer vào cloud" phải nằm gọn trong GitHub Actions
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import logging
 import os
+import random
 import re
 import sys
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
@@ -132,6 +135,200 @@ def _entry_path(entry: Any) -> str | None:
     if isinstance(entry, dict):
         return entry.get("path") or entry.get("remotepath")
     return getattr(entry, "path", None) or getattr(entry, "remotepath", None)
+
+
+def _entry_is_dir(entry: Any) -> bool:
+    if isinstance(entry, dict):
+        return bool(entry.get("isdir") or entry.get("is_dir"))
+    is_dir = getattr(entry, "is_dir", None)
+    if is_dir is not None:
+        return bool(is_dir() if callable(is_dir) else is_dir)
+    return bool(getattr(entry, "isdir", False))
+
+
+def _entry_fs_id(entry: Any) -> Any:
+    if isinstance(entry, dict):
+        return entry.get("fs_id")
+    return getattr(entry, "fs_id", None)
+
+
+# Chặn đệ quy vô hạn nếu Baidu trả cấu trúc lồng nhau lỗi/vòng lặp khi đào sâu
+# vào 1 Folder bộ phim con của link share (khác BAIDU_MAX_SCAN_DEPTH bên
+# baidu_downloader.py — đó là quét CÂY THƯ MỤC RIÊNG trên Cloud cá nhân SAU
+# transfer, còn hằng số này là quét TRỰC TIẾP bên trong link share CỦA NGƯỜI
+# KHÁC TRƯỚC khi transfer).
+MAX_SHARE_SUBFOLDER_DEPTH = 8
+
+_EPISODE_NUMBER_RE = re.compile(r"(\d+)")
+
+
+def _natural_sort_key(entry: Any) -> tuple:
+    """Trích số tập bằng Regex từ TÊN FILE (không phải cả path) để sắp xếp
+    tăng dần đúng thứ tự tập (1, 2, 3... chứ không phải sort chuỗi kiểu "1,
+    10, 2, 3..."). Entry không tách được số tập bị đẩy xuống CUỐI danh sách."""
+    name = Path(_entry_path(entry) or "").name
+    numbers = [int(n) for n in _EPISODE_NUMBER_RE.findall(name)]
+    has_number = 1 if numbers else 0
+    return (1 - has_number, numbers, name)
+
+
+def _derive_flat_drama_id(share_url: str) -> str:
+    """Sinh 1 drama_id ỔN ĐỊNH cho trường hợp link share KHÔNG có Folder bộ
+    phim con (bản thân link share đã là 1 bộ phim, file .mp4 nằm ngay cấp
+    gốc). Giữ đồng bộ với `_derive_flat_drama_id` bên baidu_downloader.py —
+    CÙNG công thức để `processed_drama_ids` do HF Space gửi sang khớp đúng
+    id mà job này tự tính ra."""
+    clean = share_url.split("?", 1)[0]
+    match = re.search(r"/s/1([A-Za-z0-9_-]+)", clean)
+    if match:
+        return f"flat:{match.group(1)}"
+    return f"flat:{hashlib.md5(clean.encode('utf-8')).hexdigest()[:12]}"
+
+
+def _pick_unprocessed_entry(
+    entries: list[Any], processed_drama_ids: "set[str] | frozenset[str]",
+) -> "tuple[Any, str] | tuple[None, None]":
+    """Nhận danh sách entry Ở CẤP GỐC của link share, trả về
+    `(entry_đã_chọn, drama_id)` — random 1 entry CHƯA có trong
+    `processed_drama_ids`. Trả về `(None, None)` (KHÔNG raise) nếu mọi entry
+    đều đã xử lý — tầng gọi (`main()`) tự quyết định gửi callback
+    `status="all_processed"` rồi thoát êm, vì exception không serialize được
+    qua webhook JSON."""
+    candidates: list[tuple[Any, str]] = []
+    for entry in entries:
+        path = _entry_path(entry)
+        if not path:
+            continue
+        candidates.append((entry, f"folder:{Path(path).name}"))
+
+    if not candidates:
+        raise BaiduDownloadError("Link share rỗng — shared_paths() không trả về entry nào.")
+
+    unprocessed = [(e, did) for e, did in candidates if did not in processed_drama_ids]
+    if not unprocessed:
+        return None, None
+
+    return random.choice(unprocessed)
+
+
+def _call_list_shared_paths(
+    api: BaiduPCSApi, folder_entry: Any, uk: Any, share_id: Any, bdstoken: Any, share_url: str,
+) -> "list[Any] | None":
+    """Gọi API liệt kê ITEM CON của 1 THƯ MỤC bên trong link share (khác
+    `shared_paths()` — hàm đó CHỈ trả entry cấp gốc). README chính thức của
+    baidupcs-py KHÔNG công bố rõ tên/chữ ký của method này, nên thử LẦN LƯỢT
+    vài tên method hay gặp nhất trong các bản khác nhau
+    (`list_shared_paths`/`shared_dir_list`/`list_shared_dir`), tự dò chữ ký
+    bằng `inspect.signature` giống hệt cách `_call_access_shared()` đã làm ở
+    trên, thay vì đoán cứng cú pháp.
+
+    Trả về `None` (KHÔNG raise) nếu KHÔNG method nào gọi được — tầng gọi
+    (`_collect_mp4_entries`) chịu trách nhiệm raise lỗi rõ ràng, để log phân
+    biệt được "API không hỗ trợ" với "API hỗ trợ nhưng lỗi khác".
+    """
+    folder_path = _entry_path(folder_entry)
+    if not folder_path:
+        return None
+
+    candidate_names = ("list_shared_paths", "shared_dir_list", "list_shared_dir")
+    for name in candidate_names:
+        fn = getattr(api, name, None)
+        if not callable(fn):
+            continue
+
+        try:
+            sig = inspect.signature(fn)
+            param_names = [
+                p.name for p in sig.parameters.values()
+                if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+            ]
+        except (TypeError, ValueError):
+            param_names = []
+
+        kwargs: dict[str, Any] = {}
+        for cand in ("sharedpath", "shared_path", "dir", "remotepath", "path"):
+            if cand in param_names:
+                kwargs[cand] = folder_path
+                break
+        if "uk" in param_names:
+            kwargs["uk"] = uk
+        for cand in ("share_id", "shareid"):
+            if cand in param_names:
+                kwargs[cand] = share_id
+                break
+        if "bdstoken" in param_names:
+            kwargs["bdstoken"] = bdstoken
+
+        try:
+            if len(kwargs) >= 3:
+                logger.debug("Thử api.%s(**%s)...", name, {k: v for k, v in kwargs.items()})
+                result = fn(**kwargs)
+            else:
+                logger.debug(
+                    "Không map được đủ tham số qua introspection cho api.%s() — "
+                    "fallback gọi theo vị trí (sharedpath, uk, share_id, bdstoken).",
+                    name,
+                )
+                result = fn(folder_path, uk, share_id, bdstoken)
+            logger.info(
+                "[BaiduPCS] api.%s('%s') OK — %d item con.",
+                name, folder_path, len(result) if result else 0,
+            )
+            return list(result) if result else []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Thử gọi api.%s(...) để đào sâu vào Folder thất bại: %s", name, exc)
+            continue
+
+    return None
+
+
+def _collect_mp4_entries(
+    api: BaiduPCSApi,
+    folder_entry: Any,
+    uk: Any,
+    share_id: Any,
+    bdstoken: Any,
+    share_url: str,
+    _depth: int = 0,
+) -> list[Any]:
+    """
+    BƯỚC quan trọng — Chui vào Folder bộ phim đã chọn & LỌC lấy CHỈ file
+    `.mp4` lẻ (đệ quy — Folder có thể lồng nhau 2-3 cấp), để tầng gọi CHỈ
+    truyền `fs_id` của các file `.mp4` này vào `transfer_shared_paths()` —
+    TUYỆT ĐỐI KHÔNG dùng fs_id của thư mục mẹ, tránh Baidu trả lỗi
+    `130 (转存文件数超限)`.
+    """
+    if _depth > MAX_SHARE_SUBFOLDER_DEPTH:
+        logger.warning(
+            "[BaiduPCS] Đã đào sâu quá %d cấp trong Folder share — dừng lại "
+            "để tránh đệ quy vô hạn (cấu trúc share bất thường?).",
+            MAX_SHARE_SUBFOLDER_DEPTH,
+        )
+        return []
+
+    children = _call_list_shared_paths(api, folder_entry, uk, share_id, bdstoken, share_url)
+    if children is None:
+        raise BaiduDownloadError(
+            "Bản baidupcs-py đang cài KHÔNG có method liệt kê item con của 1 "
+            "Folder bên trong link share (đã thử list_shared_paths/"
+            "shared_dir_list/list_shared_dir, không cái nào gọi được) — "
+            "không thể lọc riêng file .mp4 để tránh truyền fs_id thư mục mẹ. "
+            "Vui lòng `pip install -U baidupcs-py` lên bản mới nhất, hoặc "
+            "kiểm tra lại tên method thật của bản đang cài."
+        )
+
+    mp4_entries: list[Any] = []
+    for child in children:
+        if _entry_is_dir(child):
+            mp4_entries.extend(
+                _collect_mp4_entries(api, child, uk, share_id, bdstoken, share_url, _depth=_depth + 1)
+            )
+            continue
+        path = _entry_path(child)
+        if path and Path(path).suffix.lower() == ".mp4":
+            mp4_entries.append(child)
+
+    return mp4_entries
 
 
 def _build_full_share_url(share_url: str, passcode: str) -> str:
@@ -284,7 +481,14 @@ def _dump_transfer_shared_paths_source(api: BaiduPCSApi) -> None:
 
 
 def _call_transfer_shared_paths(
-    api: BaiduPCSApi, dest_dir: str, entries: list[Any], share_url: str,
+    api: BaiduPCSApi,
+    dest_dir: str,
+    entries: list[Any],
+    share_url: str,
+    *,
+    uk_override: Any = None,
+    share_id_override: Any = None,
+    bdstoken_override: Any = None,
 ) -> Any:
     """Gọi `api.transfer_shared_paths()` với CHỮ KÝ THẬT — lần 3 xác nhận,
     lần này đối chiếu TRỰC TIẾP với `inspect.getsource()` dump tại runtime
@@ -318,9 +522,14 @@ def _call_transfer_shared_paths(
         raise BaiduDownloadError("Không có entry nào để transfer (danh sách rỗng).")
 
     first = entries[0]
-    uk = getattr(first, "uk", None)
-    share_id = getattr(first, "share_id", None)
-    bdstoken = getattr(first, "bdstoken", None)
+    # uk/share_id/bdstoken là thuộc tính CHUNG của CẢ link share (không đổi
+    # theo từng entry con) — nếu entry (vd: file .mp4 đào được từ 1 Folder
+    # con lồng sâu) không tự mang theo field này, fallback về giá trị đã lấy
+    # từ danh sách entry CẤP GỐC (`shared_paths()`) do caller truyền vào qua
+    # *_override, thay vì raise lỗi "thiếu field" oan uổng.
+    uk = getattr(first, "uk", None) if uk_override is None else uk_override
+    share_id = getattr(first, "share_id", None) if share_id_override is None else share_id_override
+    bdstoken = getattr(first, "bdstoken", None) if bdstoken_override is None else bdstoken_override
     fs_ids = [getattr(e, "fs_id", None) for e in entries]
     fs_ids = [f for f in fs_ids if f is not None]
 
@@ -392,7 +601,21 @@ def main() -> None:
     bduss = _env("BAIDU_BDUSS")
     stoken = _env("BAIDU_STOKEN", required=False)
 
-    logger.info("Job %s — resolving share_url=%s -> dest_dir=%s", job_id, share_url, dest_dir)
+    raw_processed_ids = _env("PROCESSED_DRAMA_IDS", required=False)
+    try:
+        processed_drama_ids: set[str] = set(json.loads(raw_processed_ids)) if raw_processed_ids else set()
+    except (json.JSONDecodeError, TypeError) as exc:
+        logger.warning(
+            "PROCESSED_DRAMA_IDS không parse được thành mảng JSON hợp lệ "
+            "(raw=%r) — coi như rỗng, có thể dedup sai/random trùng bộ phim "
+            "đã xử lý: %s", raw_processed_ids, exc,
+        )
+        processed_drama_ids = set()
+
+    logger.info(
+        "Job %s — resolving share_url=%s -> dest_dir=%s (%d drama_id đã xử lý trước đó)",
+        job_id, share_url, dest_dir, len(processed_drama_ids),
+    )
 
     try:
         api = BaiduPCSApi(bduss=bduss, stoken=stoken or None)
@@ -463,22 +686,99 @@ def main() -> None:
             sys.exit(1)
 
         # ------------------------------------------------------------- #
+        # BƯỚC 2.5 — Random chọn 1 Folder bộ phim CHƯA có trong
+        # processed_drama_ids (né trùng), rồi ĐÀO SÂU vào trong Folder đó để
+        # lấy danh sách item con và LỌC CHỈ file `.mp4` — nếu link share
+        # KHÔNG có Folder con (toàn file lẻ ở cấp gốc), coi cả link share là
+        # 1 "bộ phim phẳng" và lọc .mp4 ngay trên danh sách cấp gốc.
+        # ------------------------------------------------------------- #
+        entries = list(shared_paths)
+        dir_entries = [e for e in entries if _entry_is_dir(e)]
+        root_uk = getattr(entries[0], "uk", None)
+        root_share_id = getattr(entries[0], "share_id", None)
+        root_bdstoken = getattr(entries[0], "bdstoken", None)
+
+        if dir_entries:
+            chosen_entry, drama_id = _pick_unprocessed_entry(dir_entries, processed_drama_ids)
+            if chosen_entry is None:
+                logger.info(
+                    "Toàn bộ %d Folder bộ phim trong link share này đã có trong "
+                    "processed_drama_ids — không còn gì mới để chọn.", len(dir_entries),
+                )
+                _send_callback(
+                    callback_url, webhook_secret, job_id, {"status": "all_processed"},
+                )
+                return
+
+            logger.info(
+                "Đã chọn drama_id='%s' — đang đào sâu vào Folder '%s' để lọc "
+                "file .mp4 (KHÔNG transfer nguyên fs_id thư mục mẹ)...",
+                drama_id, _entry_path(chosen_entry),
+            )
+            mp4_entries = _collect_mp4_entries(
+                api, chosen_entry, root_uk, root_share_id, root_bdstoken, share_url,
+            )
+        else:
+            drama_id = _derive_flat_drama_id(share_url)
+            if drama_id in processed_drama_ids:
+                logger.info(
+                    "Link share này (không có Folder con, drama_id='%s') đã được "
+                    "xử lý trước đó.", drama_id,
+                )
+                _send_callback(
+                    callback_url, webhook_secret, job_id, {"status": "all_processed"},
+                )
+                return
+            mp4_entries = [
+                e for e in entries
+                if not _entry_is_dir(e) and (_entry_path(e) or "").lower().endswith(".mp4")
+            ]
+
+        if not mp4_entries:
+            raise BaiduDownloadError(
+                f"Không tìm thấy file .mp4 nào (đã lọc is_file + đuôi .mp4, kể "
+                f"cả Folder con lồng nhau) cho drama_id='{drama_id}' — có thể "
+                f"Folder này chỉ chứa phụ đề/ảnh/rác, hoặc share đã die."
+            )
+
+        # BƯỚC 2.6 — Natural sort theo số tập trích từ TÊN FILE bằng Regex,
+        # để `saved_paths` trả về (và fs_ids truyền vào transfer) ĐÃ ĐÚNG thứ
+        # tự tập tăng dần — HF Space tải về theo đúng thứ tự này, không cần
+        # tự sort lại (dù `automation.py` vẫn tự sort lại 1 lần nữa cho an
+        # toàn kép, xem `_natural_sort_episodes`).
+        mp4_entries.sort(key=_natural_sort_key)
+        logger.info(
+            "Đã lọc + sort được %d file .mp4 cho drama_id='%s': %s",
+            len(mp4_entries), drama_id,
+            [Path(_entry_path(e) or "").name for e in mp4_entries],
+        )
+
+        # ------------------------------------------------------------- #
         # BƯỚC 3 — transfer_shared_paths() PHẢI chạy cùng process với
         # shared_paths() ở trên (object Python mang uk/shareid, không
-        # serialize qua JSON được). Xem docstring `_call_transfer_shared_paths`
-        # để biết chữ ký thật đã xác nhận qua lỗi thực tế trên production.
+        # serialize qua JSON được). CHỈ truyền fs_id của các file .mp4 đã
+        # lọc — TUYỆT ĐỐI KHÔNG fs_id của thư mục mẹ (né lỗi Baidu 130). Xem
+        # docstring `_call_transfer_shared_paths` để biết chữ ký thật đã xác
+        # nhận qua lỗi thực tế trên production.
         # ------------------------------------------------------------- #
         _dump_transfer_shared_paths_source(api)
-        _call_transfer_shared_paths(api, dest_dir, list(shared_paths), share_url)
+        _call_transfer_shared_paths(
+            api, dest_dir, mp4_entries, share_url,
+            uk_override=root_uk, share_id_override=root_share_id, bdstoken_override=root_bdstoken,
+        )
 
-        saved_paths = [p for p in (_entry_path(e) for e in shared_paths) if p]
-        logger.info("Transfer thành công — %d path đã lưu vào %s", len(saved_paths), dest_dir)
+        saved_paths = [p for p in (_entry_path(e) for e in mp4_entries) if p]
+        logger.info(
+            "Transfer thành công — %d file .mp4 đã lưu vào %s (drama_id=%s)",
+            len(saved_paths), dest_dir, drama_id,
+        )
 
         _send_callback(
             callback_url, webhook_secret, job_id,
             {
                 "status": "success",
                 "dest_dir": dest_dir,
+                "drama_id": drama_id,
                 "saved_paths": saved_paths,
             },
         )
