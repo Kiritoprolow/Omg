@@ -153,6 +153,27 @@ def _entry_fs_id(entry: Any) -> Any:
     return getattr(entry, "fs_id", None)
 
 
+def _entry_filename(entry: Any) -> str | None:
+    """Lấy NGUYÊN VĂN tên thư mục/file (KHÔNG qua Regex/tách số) — ưu tiên
+    field `server_filename` (tên Baidu trả về, đúng y hệt tên hiển thị trên
+    Cloud), fallback `filename`, rồi mới fallback về tên cuối cùng của
+    `path`/`remotepath` (`Path(...).name`) nếu entry không có sẵn 2 field
+    trên. Dùng làm `drama_id` — KHÔNG được dùng Regex tách số ở đầu tên
+    thư mục để làm id, vì tên folder trên thực tế bị đánh số lộn xộn (VD:
+    thư mục "217" xuất hiện ở vị trí thứ 15 trong danh sách) khiến số bị
+    tách ra không phản ánh đúng danh tính bộ phim — phải giữ NGUYÊN chuỗi
+    tên gốc để so khớp/dedup chính xác 1-1 với `PROCESSED_DRAMA_IDS`."""
+    if isinstance(entry, dict):
+        name = entry.get("server_filename") or entry.get("filename")
+    else:
+        name = getattr(entry, "server_filename", None) or getattr(entry, "filename", None)
+    if name:
+        return str(name)
+
+    path = _entry_path(entry)
+    return Path(path).name if path else None
+
+
 # Chặn đệ quy vô hạn nếu Baidu trả cấu trúc lồng nhau lỗi/vòng lặp khi đào sâu
 # vào 1 Folder bộ phim con của link share (khác BAIDU_MAX_SCAN_DEPTH bên
 # baidu_downloader.py — đó là quét CÂY THƯ MỤC RIÊNG trên Cloud cá nhân SAU
@@ -194,13 +215,21 @@ def _pick_unprocessed_entry(
     `processed_drama_ids`. Trả về `(None, None)` (KHÔNG raise) nếu mọi entry
     đều đã xử lý — tầng gọi (`main()`) tự quyết định gửi callback
     `status="all_processed"` rồi thoát êm, vì exception không serialize được
-    qua webhook JSON."""
+    qua webhook JSON.
+
+    `drama_id` = NGUYÊN VĂN tên thư mục gốc (`_entry_filename` — ưu tiên
+    `server_filename`/`filename`), KHÔNG qua bất kỳ Regex/tách số nào và
+    KHÔNG có prefix `folder:` — so khớp trực tiếp 1-1 với chuỗi trong
+    `PROCESSED_DRAMA_IDS` do HF Space gửi sang. TUYỆT ĐỐI KHÔNG tách số ở
+    đầu tên thư mục để làm id — tên folder trên thực tế bị đánh số lộn xộn
+    (VD: "217" nhưng lại nằm ở vị trí thứ 15 trong danh sách), tách số ra
+    dùng làm id sẽ dedup SAI bộ phim."""
     candidates: list[tuple[Any, str]] = []
     for entry in entries:
-        path = _entry_path(entry)
-        if not path:
+        name = _entry_filename(entry)
+        if not name:
             continue
-        candidates.append((entry, f"folder:{Path(path).name}"))
+        candidates.append((entry, name))
 
     if not candidates:
         raise BaiduDownloadError("Link share rỗng — shared_paths() không trả về entry nào.")
@@ -283,6 +312,44 @@ def _call_list_shared_paths(
     return None
 
 
+def _filter_children_within_scope(children: list[Any], parent_path: "str | None") -> list[Any]:
+    """CHỐT AN TOÀN QUAN TRỌNG (né bug tràn quét >6.800 file ngoài Folder đã
+    chọn): 1 số bản baidupcs-py/API Baidu, khi gọi hàm liệt kê item con của
+    1 Folder cụ thể (`list_shared_paths`/`shared_dir_list`/`list_shared_dir`),
+    ĐÔI KHI KHÔNG lọc đúng theo tham số path truyền vào mà trả về luôn CẢ
+    CÂY thư mục của TOÀN BỘ link share — khiến `_collect_mp4_entries` tưởng
+    nhầm đó là item con của 1 Folder phim rồi đệ quy quét tràn lan ra ngoài
+    phạm vi Folder đã chọn.
+
+    Hàm này LỌC LẠI TRIỆT ĐỂ ngay sau khi nhận `children`: CHỈ giữ entry có
+    `path` THỰC SỰ nằm trong `parent_path` (bằng chính `parent_path`, hoặc
+    bắt đầu bằng `parent_path/`) — entry path KHÔNG khớp bị LOẠI BỎ + log
+    WARNING. Đây là chốt chặn ở tầng code, KHÔNG phụ thuộc vào việc thư viện
+    có lọc đúng hay không."""
+    if not parent_path:
+        return children
+
+    prefix = parent_path.rstrip("/") + "/"
+    in_scope: list[Any] = []
+    out_of_scope = 0
+    for child in children:
+        child_path = _entry_path(child)
+        if child_path and (child_path == parent_path or child_path.startswith(prefix)):
+            in_scope.append(child)
+        else:
+            out_of_scope += 1
+
+    if out_of_scope:
+        logger.warning(
+            "Đã LOẠI %d entry NẰM NGOÀI phạm vi Folder '%s' mà API liệt kê "
+            "item con lỡ trả về (hành vi lạ/bug của baidupcs-py hoặc Baidu "
+            "API) — CHỈ giữ lại entry thực sự nằm bên trong Folder phim đã "
+            "chọn, tuyệt đối không quét tràn ra Root Share.",
+            out_of_scope, parent_path,
+        )
+    return in_scope
+
+
 def _collect_mp4_entries(
     api: BaiduPCSApi,
     folder_entry: Any,
@@ -298,6 +365,14 @@ def _collect_mp4_entries(
     truyền `fs_id` của các file `.mp4` này vào `transfer_shared_paths()` —
     TUYỆT ĐỐI KHÔNG dùng fs_id của thư mục mẹ, tránh Baidu trả lỗi
     `130 (转存文件数超限)`.
+
+    `folder_entry` LUÔN LUÔN là entry Folder phim ĐÃ CHỌN (`chosen_entry`)
+    hoặc 1 Folder con lồng bên trong nó qua đệ quy — hàm này TUYỆT ĐỐI
+    KHÔNG được gọi với entry cấp gốc (root) của link share, để tránh quét
+    tràn ra toàn bộ Root Share (đã từng gặp thực tế: quét nhầm hơn 6.800
+    file thay vì chỉ file bên trong 1 Folder phim). `_filter_children_within_
+    scope()` là chốt chặn thêm ở TỪNG CẤP đệ quy, phòng trường hợp API liệt
+    kê item con trả nhầm entry ngoài phạm vi Folder hiện tại.
     """
     if _depth > MAX_SHARE_SUBFOLDER_DEPTH:
         logger.warning(
@@ -317,6 +392,10 @@ def _collect_mp4_entries(
             "Vui lòng `pip install -U baidupcs-py` lên bản mới nhất, hoặc "
             "kiểm tra lại tên method thật của bản đang cài."
         )
+
+    # Chốt an toàn: chỉ giữ item con THỰC SỰ nằm trong folder_entry hiện tại
+    # — tuyệt đối không để lọt entry ngoài phạm vi Folder phim đã chọn.
+    children = _filter_children_within_scope(children, _entry_path(folder_entry))
 
     mp4_entries: list[Any] = []
     for child in children:
@@ -457,6 +536,103 @@ def _is_retryable_transfer_error(exc: Exception) -> bool:
     return any(marker in msg for marker in _RETRYABLE_TRANSFER_ERROR_MARKERS)
 
 
+def _is_error_code_2(exc: Exception) -> bool:
+    """Nhận diện lỗi Baidu trả về `error_code`/`errno` = 2 (`参数错误` — tham
+    số không hợp lệ). Thực tế cho thấy lỗi này thường xảy ra khi 1 (vài)
+    `fs_id` CỤ THỂ trong batch bị hỏng/đã bị xoá khỏi share/không còn hợp lệ
+    — KHÔNG phải lỗi cấu hình của TOÀN BỘ batch. Dùng để quyết định fallback
+    tách batch ra transfer từng `fs_id` lẻ, thay vì để 1 file hỏng chặn đứng
+    cả batch (hoặc raise chết luôn cả quá trình)."""
+    errno, _errmsg = _extract_errno_errmsg(exc)
+    if errno is not None:
+        try:
+            if int(errno) == 2:
+                return True
+        except (TypeError, ValueError):
+            pass
+    msg = str(exc)
+    if re.search(r"error_code[\"']?\s*[:=]\s*2\b", msg, re.IGNORECASE):
+        return True
+    if re.search(r"\berrno[\"']?\s*[:=]\s*2\b", msg, re.IGNORECASE):
+        return True
+    return "参数错误" in msg
+
+
+def _transfer_fs_ids_individually(
+    api: BaiduPCSApi,
+    dest_dir: str,
+    fs_ids: list[Any],
+    uk: Any,
+    share_id: Any,
+    bdstoken: Any,
+    share_url: str,
+    batch_index: int,
+    total_batches: int,
+) -> list[Any]:
+    """FALLBACK khi cả 1 batch bị Baidu từ chối với `error_code=2` (`参数错误`)
+    — thường do 1 (vài) `fs_id` CỤ THỂ trong batch bị hỏng/đã bị xoá khỏi
+    share/không còn hợp lệ, KHÔNG phải lỗi của toàn bộ batch. Thay vì để 1
+    file hỏng chặn đứng cả batch, hàm này TÁCH batch ra, transfer TỪNG
+    `fs_id` RIÊNG LẺ — `fs_id` nào tiếp tục dính `error_code=2` sẽ bị BỎ QUA
+    (log WARNING, KHÔNG raise), các file `.mp4` còn lại trong bộ vẫn được
+    transfer bình thường. Chỉ raise nếu TẤT CẢ `fs_id` lẻ trong batch đều
+    thất bại (không transfer thành công được file nào)."""
+    results: list[Any] = []
+    skipped: list[Any] = []
+    for fs_id in fs_ids:
+        last_exc: Exception | None = None
+        for attempt in range(1, BAIDU_TRANSFER_MAX_RETRIES + 1):
+            try:
+                result = api.transfer_shared_paths(
+                    dest_dir, [fs_id], uk, share_id, bdstoken, share_url,
+                )
+                results.append(result)
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001 - cần bắt mọi lỗi để quyết định skip/retry
+                last_exc = exc
+                if _is_error_code_2(exc):
+                    # error_code=2 ở file LẺ -> gần như chắc chắn CHÍNH file
+                    # này hỏng/đã bị xoá khỏi share -> KHÔNG phải lỗi tạm
+                    # thời, retry vô ích -> bỏ qua ngay, không tốn lượt retry.
+                    break
+                if attempt >= BAIDU_TRANSFER_MAX_RETRIES or not _is_retryable_transfer_error(exc):
+                    break
+                time.sleep(BAIDU_TRANSFER_BATCH_SLEEP_SECONDS)
+
+        if last_exc is not None:
+            skipped.append(fs_id)
+            logger.warning(
+                "[Batch %d/%d] fs_id=%r transfer LỖI (error_code=2 hoặc lỗi "
+                "không retry được) — BỎ QUA file này, tiếp tục transfer các "
+                "file .mp4 còn lại trong bộ. Lỗi gốc: %s",
+                batch_index, total_batches, fs_id, last_exc,
+            )
+
+    if not results:
+        raise BaiduDownloadError(
+            f"Batch {batch_index}/{total_batches}: TẤT CẢ {len(fs_ids)} fs_id "
+            f"lẻ (đã tách ra để né error_code=2) đều transfer thất bại — có "
+            f"thể toàn bộ file trong batch này đều hỏng/không hợp lệ."
+        )
+
+    if skipped:
+        logger.warning(
+            "[Batch %d/%d] Đã BỎ QUA %d/%d fs_id lỗi (error_code=2 hoặc lỗi "
+            "không retry được), transfer THÀNH CÔNG %d/%d fs_id còn lại.",
+            batch_index, total_batches, len(skipped), len(fs_ids),
+            len(fs_ids) - len(skipped), len(fs_ids),
+        )
+    else:
+        logger.info(
+            "[Batch %d/%d] Transfer lẻ TẤT CẢ %d fs_id thành công (không có "
+            "file nào bị bỏ qua).",
+            batch_index, total_batches, len(fs_ids),
+        )
+
+    return results
+
+
 def _dump_transfer_shared_paths_source(api: BaiduPCSApi) -> None:
     """CHẨN ĐOÁN: in ra SOURCE CODE THẬT của `transfer_shared_paths()` ở CẢ 2
     tầng (BaiduPCSApi.transfer_shared_paths và BaiduPCS.transfer_shared_paths
@@ -562,6 +738,13 @@ def _call_transfer_shared_paths(
     hạn) sẽ raise NGAY, không retry vô ích. CHỈ coi là thành công nếu TẤT CẢ
     batch đều transfer xong; 1 batch lỗi (sau khi hết retry) sẽ raise ngay
     lập tức, không âm thầm bỏ qua phần còn lại.
+
+    FALLBACK RIÊNG cho `error_code=2` (`参数错误`, xem `_is_error_code_2`):
+    lỗi này thường do 1 fs_id CỤ THỂ trong batch bị hỏng/đã bị xoá khỏi
+    share, KHÔNG phải lỗi của toàn bộ batch -> KHÔNG raise chết cả batch mà
+    TÁCH RA transfer từng fs_id lẻ (`_transfer_fs_ids_individually`), fs_id
+    nào tiếp tục lỗi 2 thì log WARNING bỏ qua, các file .mp4 còn lại trong
+    bộ vẫn transfer bình thường.
     """
     if not entries:
         raise BaiduDownloadError("Không có entry nào để transfer (danh sách rỗng).")
@@ -629,6 +812,19 @@ def _call_transfer_shared_paths(
                 break
             except Exception as exc:  # noqa: BLE001 - cần bắt mọi lỗi để quyết định retry
                 last_exc = exc
+                if _is_error_code_2(exc):
+                    # error_code=2 (参数错误) -> thường do 1 fs_id CỤ THỂ
+                    # trong batch bị hỏng/không hợp lệ, KHÔNG phải lỗi mạng
+                    # tạm thời -> retry lại NGUYÊN batch vô ích, dừng ngay để
+                    # rơi xuống fallback tách lẻ fs_id bên dưới.
+                    logger.warning(
+                        "Batch %d/%d dính error_code=2 (参数错误, lần thử %d/%d) "
+                        "— dừng retry nguyên batch, sẽ TÁCH LẺ %d fs_id để "
+                        "xác định + bỏ qua đúng file hỏng: %s",
+                        batch_index, len(batches), attempt, BAIDU_TRANSFER_MAX_RETRIES,
+                        len(batch_fs_ids), exc,
+                    )
+                    break
                 retryable = _is_retryable_transfer_error(exc)
                 if attempt >= BAIDU_TRANSFER_MAX_RETRIES or not retryable:
                     logger.warning(
@@ -647,10 +843,20 @@ def _call_transfer_shared_paths(
                 time.sleep(BAIDU_TRANSFER_BATCH_SLEEP_SECONDS)
 
         if last_exc is not None:
-            raise BaiduDownloadError(
-                f"Batch {batch_index}/{len(batches)} ({len(batch_fs_ids)} fs_id) "
-                f"transfer thất bại sau {BAIDU_TRANSFER_MAX_RETRIES} lần thử: {last_exc}"
-            ) from last_exc
+            if _is_error_code_2(last_exc) and len(batch_fs_ids) > 1:
+                # FALLBACK: batch lỗi error_code=2 -> tách lẻ, transfer từng
+                # fs_id — file nào tiếp tục lỗi 2 thì bỏ qua (log WARNING),
+                # KHÔNG chặn cả batch/cả bộ phim vì 1 file hỏng.
+                batch_result = _transfer_fs_ids_individually(
+                    api, dest_dir, batch_fs_ids, uk, share_id, bdstoken, share_url,
+                    batch_index, len(batches),
+                )
+                results.append(batch_result)
+            else:
+                raise BaiduDownloadError(
+                    f"Batch {batch_index}/{len(batches)} ({len(batch_fs_ids)} fs_id) "
+                    f"transfer thất bại sau {BAIDU_TRANSFER_MAX_RETRIES} lần thử: {last_exc}"
+                ) from last_exc
 
         # Nghỉ giữa các batch (kể cả sau batch cuối thì không cần) để né rate
         # limit — Baidu dễ trả 504 nếu request dồn dập liên tục.
