@@ -49,6 +49,7 @@ import os
 import random
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
@@ -425,6 +426,37 @@ class BaiduDownloadError(Exception):
     ràng để callback trả về error_message hữu ích cho tầng gọi (HF Space)."""
 
 
+# FIX (504 Gateway Timeout + JSONDecodeError): gửi TOÀN BỘ fs_ids của cả
+# 1 bộ phim (có thể vài chục -> hàng trăm tập) trong 1 request
+# transfer_shared_paths() DUY NHẤT khiến Baidu xử lý quá lâu -> timeout ở
+# tầng gateway (504) -> trả về HTML lỗi thay vì JSON -> baidupcs-py cố
+# json.loads() body đó crash với JSONDecodeError. Từ giờ CHIA NHỎ fs_ids
+# thành từng batch nhỏ, gọi transfer TUẦN TỰ từng batch thay vì 1 lần.
+BAIDU_TRANSFER_BATCH_SIZE = 12  # tối đa 10-15 fs_id/batch theo yêu cầu
+BAIDU_TRANSFER_BATCH_SLEEP_SECONDS = 1.0  # nghỉ giữa các batch để né rate limit
+BAIDU_TRANSFER_MAX_RETRIES = 3  # số lần thử tối đa/batch khi lỗi mạng/504/JSONDecodeError
+
+# Cụm từ nhận diện lỗi CÓ THỂ retry được (mạng chập chờn/Baidu quá tải khi
+# batch vẫn còn hơi to) — KHÔNG bao gồm lỗi tham số sai/hết dung lượng/token
+# hết hạn, vì retry không giải quyết được các lỗi đó (xem _classify_transfer_error).
+_RETRYABLE_TRANSFER_ERROR_MARKERS = (
+    "504", "gateway timeout", "jsondecodeerror", "expecting value",
+    "timeout", "connection", "timed out",
+)
+
+
+def _is_retryable_transfer_error(exc: Exception) -> bool:
+    """Nhận diện lỗi mạng/504/JSONDecodeError (tạm thời, đáng để retry) —
+    khác với lỗi cấu hình/logic (sai tham số, hết dung lượng, token hết
+    hạn...) mà retry không bao giờ tự hết được."""
+    if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+        return True
+    if isinstance(exc, json.JSONDecodeError):
+        return True
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _RETRYABLE_TRANSFER_ERROR_MARKERS)
+
+
 def _dump_transfer_shared_paths_source(api: BaiduPCSApi) -> None:
     """CHẨN ĐOÁN: in ra SOURCE CODE THẬT của `transfer_shared_paths()` ở CẢ 2
     tầng (BaiduPCSApi.transfer_shared_paths và BaiduPCS.transfer_shared_paths
@@ -517,6 +549,19 @@ def _call_transfer_shared_paths(
     trong cùng 1 link share, chỉ cần lấy từ entry đầu tiên. `shared_url`
     PHẢI là share_url GỐC (giữ `?pwd=...` nếu có, cùng giá trị đã dùng gọi
     `shared_paths()`).
+
+    FIX (504 Gateway Timeout + JSONDecodeError khi fs_ids quá dài): thay vì
+    gửi TOÀN BỘ fs_ids trong 1 request `transfer_shared_paths()` duy nhất
+    (dễ khiến Baidu xử lý quá lâu -> 504 -> body trả về không phải JSON hợp
+    lệ -> JSONDecodeError), hàm này CHIA NHỎ fs_ids thành từng batch tối đa
+    `BAIDU_TRANSFER_BATCH_SIZE` fs_id, rồi gọi transfer TUẦN TỰ từng batch
+    (nghỉ `BAIDU_TRANSFER_BATCH_SLEEP_SECONDS` giây giữa 2 batch để né rate
+    limit). Mỗi batch tự retry tối đa `BAIDU_TRANSFER_MAX_RETRIES` lần nếu
+    dính lỗi mạng/504/JSONDecodeError (`_is_retryable_transfer_error`) —
+    lỗi không thuộc nhóm này (vd sai tham số, hết dung lượng, token hết
+    hạn) sẽ raise NGAY, không retry vô ích. CHỈ coi là thành công nếu TẤT CẢ
+    batch đều transfer xong; 1 batch lỗi (sau khi hết retry) sẽ raise ngay
+    lập tức, không âm thầm bỏ qua phần còn lại.
     """
     if not entries:
         raise BaiduDownloadError("Không có entry nào để transfer (danh sách rỗng).")
@@ -545,17 +590,78 @@ def _call_transfer_shared_paths(
             f"tiên: {first!r}"
         )
 
-    logger.debug(
-        "Gọi transfer_shared_paths(remotedir=%r, fs_ids=%r, uk=%r, "
-        "share_id=%r, bdstoken=%r..., shared_url=%r)",
-        dest_dir, fs_ids, uk, share_id,
-        (bdstoken[:8] + "...") if isinstance(bdstoken, str) else bdstoken,
-        share_url,
+    batches = [
+        fs_ids[i : i + BAIDU_TRANSFER_BATCH_SIZE]
+        for i in range(0, len(fs_ids), BAIDU_TRANSFER_BATCH_SIZE)
+    ]
+    logger.info(
+        "Chia %d fs_id thành %d batch (tối đa %d fs_id/batch) để transfer "
+        "tuần tự — né lỗi 504/JSONDecodeError khi gửi 1 lần quá to.",
+        len(fs_ids), len(batches), BAIDU_TRANSFER_BATCH_SIZE,
     )
+
     # QUAN TRỌNG: thứ tự đúng (đối chiếu inspect.getsource() dump tại
     # runtime) là remotedir, fs_ids, uk, share_id, bdstoken, shared_url.
-    # fs_ids truyền NGUYÊN 1 LIST (không *unpack), đứng NGAY SAU remotedir.
-    return api.transfer_shared_paths(dest_dir, fs_ids, uk, share_id, bdstoken, share_url)
+    # fs_ids của MỖI BATCH vẫn truyền NGUYÊN 1 LIST (không *unpack).
+    results: list[Any] = []
+    for batch_index, batch_fs_ids in enumerate(batches, start=1):
+        last_exc: Exception | None = None
+        for attempt in range(1, BAIDU_TRANSFER_MAX_RETRIES + 1):
+            try:
+                logger.debug(
+                    "Batch %d/%d (lần thử %d/%d) — transfer_shared_paths(remotedir=%r, "
+                    "fs_ids=%r, uk=%r, share_id=%r, bdstoken=%r..., shared_url=%r)",
+                    batch_index, len(batches), attempt, BAIDU_TRANSFER_MAX_RETRIES,
+                    dest_dir, batch_fs_ids, uk, share_id,
+                    (bdstoken[:8] + "...") if isinstance(bdstoken, str) else bdstoken,
+                    share_url,
+                )
+                result = api.transfer_shared_paths(
+                    dest_dir, batch_fs_ids, uk, share_id, bdstoken, share_url,
+                )
+                results.append(result)
+                logger.info(
+                    "Batch %d/%d (%d fs_id) transfer THÀNH CÔNG (lần thử %d/%d).",
+                    batch_index, len(batches), len(batch_fs_ids), attempt,
+                    BAIDU_TRANSFER_MAX_RETRIES,
+                )
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001 - cần bắt mọi lỗi để quyết định retry
+                last_exc = exc
+                retryable = _is_retryable_transfer_error(exc)
+                if attempt >= BAIDU_TRANSFER_MAX_RETRIES or not retryable:
+                    logger.warning(
+                        "Batch %d/%d lỗi (lần thử %d/%d, %s): %s",
+                        batch_index, len(batches), attempt, BAIDU_TRANSFER_MAX_RETRIES,
+                        "KHÔNG retry được nữa" if not retryable else "đã hết lượt retry",
+                        exc,
+                    )
+                    break
+                logger.warning(
+                    "Batch %d/%d lỗi mạng/504/JSONDecodeError (lần thử %d/%d) — "
+                    "sẽ retry sau %.1fs: %s",
+                    batch_index, len(batches), attempt, BAIDU_TRANSFER_MAX_RETRIES,
+                    BAIDU_TRANSFER_BATCH_SLEEP_SECONDS, exc,
+                )
+                time.sleep(BAIDU_TRANSFER_BATCH_SLEEP_SECONDS)
+
+        if last_exc is not None:
+            raise BaiduDownloadError(
+                f"Batch {batch_index}/{len(batches)} ({len(batch_fs_ids)} fs_id) "
+                f"transfer thất bại sau {BAIDU_TRANSFER_MAX_RETRIES} lần thử: {last_exc}"
+            ) from last_exc
+
+        # Nghỉ giữa các batch (kể cả sau batch cuối thì không cần) để né rate
+        # limit — Baidu dễ trả 504 nếu request dồn dập liên tục.
+        if batch_index < len(batches):
+            time.sleep(BAIDU_TRANSFER_BATCH_SLEEP_SECONDS)
+
+    logger.info(
+        "TẤT CẢ %d batch (%d fs_id) đã transfer thành công vào %s.",
+        len(batches), len(fs_ids), dest_dir,
+    )
+    return results
 
 
 def _send_callback(callback_url: str, webhook_secret: str, job_id: str, payload: dict) -> None:
