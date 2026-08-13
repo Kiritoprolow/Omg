@@ -181,6 +181,15 @@ def _entry_filename(entry: Any) -> str | None:
 # KHÁC TRƯỚC khi transfer).
 MAX_SHARE_SUBFOLDER_DEPTH = 8
 
+# HARD CAP an toàn (chốt chặn lớp 2 chống "cào tràn" — vụ thực tế: bug
+# list_shared_paths() của baidupcs-py đôi khi BỎ QUA sub-path truyền vào và
+# tự động trả về CẢ ROOT SHARE (~4.131 file/561 batch) khi path bị lệch định
+# dạng — không phụ thuộc baidupcs-py, đây là chốt ở tầng code của chính ta).
+# 1 bộ phim chuẩn chỉ có 50-150 tập (~5-15 batch) — KHÔNG BAO GIỜ vượt quá
+# ngưỡng này; nếu vượt, gần như chắc chắn đã quét lọt ra ngoài Folder đã
+# chọn dù đã lọc theo target_folder_name, nên phải cắt đuôi cứng.
+BAIDU_MAX_MP4_PER_DRAMA = 200
+
 _EPISODE_NUMBER_RE = re.compile(r"(\d+)")
 
 
@@ -350,6 +359,33 @@ def _filter_children_within_scope(children: list[Any], parent_path: "str | None"
     return in_scope
 
 
+def _enforce_mp4_hard_cap(mp4_entries: list[Any], drama_id: str) -> list[Any]:
+    """CHỐT CHẶN LỚP 2 (Hard Cap Safety Switch) — độc lập với lớp lọc theo
+    `target_folder_name` ở `_collect_mp4_entries`, phòng trường hợp filter đó
+    vẫn bị lọt vì lý do nào đó (VD: `path` trả về bị cắt/encode lệch không
+    còn chứa nguyên văn tên folder). 1 bộ phim chuẩn chỉ có 50-150 tập
+    (~5-15 batch) — KHÔNG BAO GIỜ vượt quá `BAIDU_MAX_MP4_PER_DRAMA`. Nếu
+    vượt, đây gần như chắc chắn là dấu hiệu quét tràn ra ngoài phạm vi Folder
+    đã chọn (đúng kiểu lỗi ~4.131 file/561 batch đã gặp thực tế) — log ERROR
+    + CẮT ĐUÔI chỉ giữ lại N file ĐẦU TIÊN, TUYỆT ĐỐI KHÔNG để lọt hàng nghìn
+    file vào vòng lặp transfer."""
+    if len(mp4_entries) <= BAIDU_MAX_MP4_PER_DRAMA:
+        return mp4_entries
+
+    dropped = len(mp4_entries) - BAIDU_MAX_MP4_PER_DRAMA
+    logger.error(
+        "[HARD CAP] drama_id='%s' có %d file .mp4 SAU KHI LỌC — VƯỢT NGƯỠNG "
+        "AN TOÀN %d file/bộ phim (dấu hiệu quét tràn ra ngoài Folder đã chọn, "
+        "kiểu lỗi ~4.131 file/561 batch đã gặp thực tế, khả năng do bug "
+        "list_shared_paths() của baidupcs-py bỏ qua sub-path và tự trả về cả "
+        "Root Share) — CẮT ĐUÔI chỉ giữ lại %d file ĐẦU TIÊN, LOẠI BỎ %d file "
+        "còn lại để chặn đứng transfer tràn.",
+        drama_id, len(mp4_entries), BAIDU_MAX_MP4_PER_DRAMA,
+        BAIDU_MAX_MP4_PER_DRAMA, dropped,
+    )
+    return mp4_entries[:BAIDU_MAX_MP4_PER_DRAMA]
+
+
 def _collect_mp4_entries(
     api: BaiduPCSApi,
     folder_entry: Any,
@@ -357,6 +393,7 @@ def _collect_mp4_entries(
     share_id: Any,
     bdstoken: Any,
     share_url: str,
+    target_folder_name: "str | None" = None,
     _depth: int = 0,
 ) -> list[Any]:
     """
@@ -373,6 +410,15 @@ def _collect_mp4_entries(
     file thay vì chỉ file bên trong 1 Folder phim). `_filter_children_within_
     scope()` là chốt chặn thêm ở TỪNG CẤP đệ quy, phòng trường hợp API liệt
     kê item con trả nhầm entry ngoài phạm vi Folder hiện tại.
+
+    `target_folder_name` (LỚP LỌC CỨNG THỨ 2, độc lập với `_filter_children_
+    within_scope`) — NGUYÊN VĂN tên (`server_filename`) của Folder phim đã
+    chọn ở cấp gốc nhất (truyền xuống KHÔNG đổi qua mọi cấp đệ quy). Chốt
+    chặn `list_shared_paths()` của baidupcs-py bị bug BỎ QUA sub-path và tự
+    trả về CẢ ROOT SHARE khi path truyền vào bị lệch định dạng (vụ thực tế:
+    ~4.131 file/561 batch thay vì chỉ 50-150 file của 1 bộ phim) — MỌI file
+    `.mp4` mà `path` của nó KHÔNG CHỨA `target_folder_name` sẽ bị SKIP NGAY
+    + log WARNING, dù đã đi qua `_filter_children_within_scope` ở trên.
     """
     if _depth > MAX_SHARE_SUBFOLDER_DEPTH:
         logger.warning(
@@ -393,20 +439,40 @@ def _collect_mp4_entries(
             "kiểm tra lại tên method thật của bản đang cài."
         )
 
-    # Chốt an toàn: chỉ giữ item con THỰC SỰ nằm trong folder_entry hiện tại
-    # — tuyệt đối không để lọt entry ngoài phạm vi Folder phim đã chọn.
+    # Chốt an toàn LỚP 1: chỉ giữ item con THỰC SỰ nằm trong folder_entry
+    # hiện tại — tuyệt đối không để lọt entry ngoài phạm vi Folder phim đã
+    # chọn.
     children = _filter_children_within_scope(children, _entry_path(folder_entry))
 
     mp4_entries: list[Any] = []
+    skipped_wrong_folder = 0
     for child in children:
         if _entry_is_dir(child):
             mp4_entries.extend(
-                _collect_mp4_entries(api, child, uk, share_id, bdstoken, share_url, _depth=_depth + 1)
+                _collect_mp4_entries(
+                    api, child, uk, share_id, bdstoken, share_url,
+                    target_folder_name=target_folder_name, _depth=_depth + 1,
+                )
             )
             continue
         path = _entry_path(child)
-        if path and Path(path).suffix.lower() == ".mp4":
-            mp4_entries.append(child)
+        if not path or Path(path).suffix.lower() != ".mp4":
+            continue
+        # Chốt an toàn LỚP 2: BẮT BUỘC path của file .mp4 phải chứa NGUYÊN
+        # VĂN tên Folder phim đã chọn — nếu không, đây gần như chắc chắn là
+        # file bị lọt ra từ bug list_shared_paths() trả nhầm cả Root Share.
+        if target_folder_name and target_folder_name not in path:
+            skipped_wrong_folder += 1
+            continue
+        mp4_entries.append(child)
+
+    if skipped_wrong_folder:
+        logger.warning(
+            "[HARD FILTER] Đã SKIP %d file .mp4 có path KHÔNG chứa tên Folder "
+            "phim đã chọn ('%s') — nghi do bug list_shared_paths() trả nhầm "
+            "cả Root Share thay vì đúng sub-path.",
+            skipped_wrong_folder, target_folder_name,
+        )
 
     return mp4_entries
 
@@ -749,6 +815,30 @@ def _call_transfer_shared_paths(
     if not entries:
         raise BaiduDownloadError("Không có entry nào để transfer (danh sách rỗng).")
 
+    # FIX (404 Not Found -> JSONDecodeError): ĐẢM BẢO 100% thư mục đích
+    # `dest_dir` (`/app_temp_download`) ĐÃ TỒN TẠI trên Baidu Cloud TRƯỚC KHI
+    # bắt đầu vòng lặp transfer batch — nếu thư mục chưa có (lần chạy đầu
+    # tiên, hoặc đã bị xoá bởi bước dọn dẹp trước đó mà chưa kịp tạo lại),
+    # Baidu trả về 404 Not Found dưới dạng HTML thay vì JSON -> baidupcs-py
+    # cố json.loads() body đó crash JSONDecodeError. Bọc try...except vì
+    # makedir() có thể raise nếu thư mục ĐÃ tồn tại sẵn (không sao, bỏ qua).
+    for method_name in ("makedir", "mkdir"):
+        makedir_fn = getattr(api, method_name, None)
+        if callable(makedir_fn):
+            try:
+                makedir_fn(dest_dir)
+                logger.info(
+                    "[BaiduPCS] Đã đảm bảo thư mục đích '%s' tồn tại trên Cloud "
+                    "(gọi api.%s()) trước khi transfer.", dest_dir, method_name,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "[BaiduPCS] api.%s('%s') lỗi (nhiều khả năng do thư mục ĐÃ "
+                    "tồn tại sẵn — bỏ qua, không chặn transfer): %s",
+                    method_name, dest_dir, exc,
+                )
+            break
+
     first = entries[0]
     # uk/share_id/bdstoken là thuộc tính CHUNG của CẢ link share (không đổi
     # theo từng entry con) — nếu entry (vd: file .mp4 đào được từ 1 Folder
@@ -1029,7 +1119,9 @@ def main() -> None:
             )
             mp4_entries = _collect_mp4_entries(
                 api, chosen_entry, root_uk, root_share_id, root_bdstoken, share_url,
+                target_folder_name=drama_id,
             )
+            mp4_entries = _enforce_mp4_hard_cap(mp4_entries, drama_id)
         else:
             drama_id = _derive_flat_drama_id(share_url)
             if drama_id in processed_drama_ids:
@@ -1045,6 +1137,7 @@ def main() -> None:
                 e for e in entries
                 if not _entry_is_dir(e) and (_entry_path(e) or "").lower().endswith(".mp4")
             ]
+            mp4_entries = _enforce_mp4_hard_cap(mp4_entries, drama_id)
 
         if not mp4_entries:
             raise BaiduDownloadError(
