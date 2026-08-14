@@ -1168,6 +1168,72 @@ def _send_callback(callback_url: str, webhook_secret: str, job_id: str, payload:
         logger.error("Gửi callback THẤT BẠI: %s", exc)
 
 
+def _list_personal_cloud_mp4s(api: "BaiduPCSApi", dest_dir: str) -> list[str]:
+    """FIX (log thực tế 14/08/2026 — 0/192 dlink resolve được, TOÀN BỘ batch
+    REST /api/filemetas trả errno=-9 "file không tồn tại"): `saved_paths` cũ
+    được build từ `_entry_path(e)` của `mp4_entries` lấy ra bởi
+    `list_shared_paths()` — tức PATH TRONG SHARE CỦA NGƯỜI KHÁC (dạng
+    `/sharelinkXXXX-YYYY/<folder>/<file>.mp4`), KHÔNG PHẢI path thật trong
+    Cloud CÁ NHÂN của mình sau khi `transfer_shared_paths()` đã chạy xong.
+    Baidu tìm path đó trong namespace cá nhân -> không thấy -> errno=-9 cho
+    100% file, dù transfer đã thành công thật.
+
+    Sửa: sau khi transfer xong, QUÉT LẠI `dest_dir` trên Cloud cá nhân bằng
+    `api.list(dest_dir, recursive=True)` (đúng pattern đã dùng ổn định ở
+    `baidu_downloader.py::_list_and_sort_mp4_episodes`) để lấy PATH THẬT rồi
+    mới đem đi resolve dlink."""
+    logger.info("[BaiduPCS] Quét lại Cloud cá nhân %s (SAU transfer) để lấy path thật...", dest_dir)
+    try:
+        entries = list(api.list(dest_dir, recursive=True))
+    except TypeError:
+        entries = _manual_recursive_list_personal_cloud(api, dest_dir)
+    except Exception as exc:  # noqa: BLE001
+        raise BaiduDownloadError(f"Quét lại Cloud cá nhân {dest_dir} thất bại: {exc}") from exc
+
+    mp4_paths: list[str] = []
+    for entry in entries:
+        if _entry_is_dir(entry):
+            continue
+        path = _entry_path(entry)
+        if path and Path(path).suffix.lower() == ".mp4":
+            mp4_paths.append(path)
+
+    logger.info(
+        "[BaiduPCS] Quét lại %s -> tìm thấy %d file .mp4 THẬT trên Cloud cá nhân.",
+        dest_dir, len(mp4_paths),
+    )
+    return mp4_paths
+
+
+def _manual_recursive_list_personal_cloud(
+    api: "BaiduPCSApi", remote_dir: str, _depth: int = 0, _max_depth: int = 12,
+) -> list[Any]:
+    """Fallback đệ quy thủ công nếu bản baidupcs-py cài trên runner chưa hỗ
+    trợ `recursive=True` ở `api.list()` — đệ quy trên Cloud CÁ NHÂN (đã xác
+    thực đầy đủ qua BDUSS/STOKEN) nên an toàn hơn nhiều so với đệ quy
+    /share/list của người khác."""
+    if _depth > _max_depth:
+        logger.warning(
+            "[BaiduPCS] Đã đệ quy quá %d cấp tại %s — dừng để tránh vòng lặp.",
+            _max_depth, remote_dir,
+        )
+        return []
+    try:
+        entries = list(api.list(remote_dir))
+    except Exception as exc:  # noqa: BLE001
+        raise BaiduDownloadError(f"Liệt kê thư mục Cloud {remote_dir} thất bại: {exc}") from exc
+
+    all_entries = list(entries)
+    for entry in entries:
+        if _entry_is_dir(entry):
+            path = _entry_path(entry)
+            if path:
+                all_entries.extend(
+                    _manual_recursive_list_personal_cloud(api, path, _depth=_depth + 1, _max_depth=_max_depth)
+                )
+    return all_entries
+
+
 def _dump_download_link_diagnostics(api: "BaiduPCSApi") -> None:
     """CHẨN ĐOÁN (theo đúng pattern đã dùng ở `_dump_transfer_shared_paths_source`
     để fix `transfer_shared_paths` trước đây): log thực tế 13/08/2026 cho
@@ -1711,7 +1777,22 @@ def main() -> None:
         transferred_entries = [
             e for e in mp4_entries if getattr(e, "fs_id", None) not in skipped_fs_ids
         ]
-        saved_paths = [p for p in (_entry_path(e) for e in transferred_entries) if p]
+
+        # FIX (log thực tế 14/08/2026, xem docstring `_list_personal_cloud_mp4s`):
+        # KHÔNG dùng lại `_entry_path(e)` của `transferred_entries` nữa — đó là
+        # path TRONG SHARE CỦA NGƯỜI KHÁC (trước transfer), không tồn tại
+        # trong Cloud cá nhân -> resolve dlink 100% ra errno=-9. Phải quét lại
+        # `dest_dir` trên Cloud cá nhân SAU transfer để lấy path thật.
+        saved_paths = _list_personal_cloud_mp4s(api, dest_dir)
+        saved_paths.sort(key=lambda p: _natural_sort_key({"path": p}))
+
+        if not saved_paths:
+            raise BaiduDownloadError(
+                f"Transfer {drama_id} báo có kết quả nhưng quét lại {dest_dir} "
+                "trên Cloud cá nhân KHÔNG thấy file .mp4 nào — có thể transfer "
+                "thực ra thất bại hết, hoặc dest_dir bị lệch."
+            )
+
         if skipped_fs_ids:
             logger.warning(
                 "Transfer THÀNH CÔNG MỘT PHẦN — %d/%d file .mp4 đã lưu vào %s "
