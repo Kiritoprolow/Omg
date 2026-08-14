@@ -989,6 +989,20 @@ def _call_transfer_shared_paths(
                     dest_dir, batch_fs_ids, uk, share_id, bdstoken, share_url,
                 )
                 results.append(result)
+                if batch_index == 1:
+                    # FIX VÒNG 4 (log thực tế 14/08/2026 — quét lại dest_dir
+                    # sau transfer luôn trả list RỖNG dù transfer báo thành
+                    # công, kể cả sau nhiều lần retry): `result` trả về từ
+                    # `api.transfer_shared_paths()` CHƯA TỪNG được đọc/log ở
+                    # đâu trong toàn bộ script — có thể đã chứa path/fs_id
+                    # THẬT trong Cloud cá nhân ngay trong response, khỏi cần
+                    # đoán mò qua việc quét lại. Dump 1 lần (batch đầu) để
+                    # biết chính xác cấu trúc cho fix tiếp theo.
+                    logger.info(
+                        "[CHẨN ĐOÁN] Raw result trả về từ api.transfer_shared_paths() "
+                        "(batch 1) — kiểm tra xem có path/fs_id thật trong Cloud cá "
+                        "nhân sẵn trong đây không: %r", result,
+                    )
                 logger.info(
                     "Batch %d/%d (%d fs_id) transfer THÀNH CÔNG (lần thử %d/%d).",
                     batch_index, len(batches), len(batch_fs_ids), attempt,
@@ -1274,7 +1288,12 @@ def _list_personal_cloud_mp4s(
 
     # FIX VÒNG 3 phần (a) — retry có backoff cho khả năng Baidu ghi file bất
     # đồng bộ (transfer báo "thành công" nhưng chưa propagate kịp).
-    _LIST_RETRY_SLEEP_SECONDS = (3.0, 6.0, 12.0)
+    # FIX VÒNG 4 (log thực tế 14/08/2026 — 4 lần thử/~22s vẫn KHÔNG đủ, dump
+    # thư mục gốc xác nhận /app_temp_download tồn tại đúng chỗ nhưng bên
+    # trong vẫn rỗng): kéo dài tổng thời gian chờ lên ~2 phút, vì thời điểm
+    # đó Baidu vừa báo lỗi lưu trữ tạm thời (error_code=4) cho batch cuối —
+    # dấu hiệu backend đang chậm/không ổn định hơn bình thường.
+    _LIST_RETRY_SLEEP_SECONDS = (5.0, 10.0, 20.0, 30.0, 45.0)
     mp4_paths: list[str] = []
     top_level_raw: dict | None = None
     for attempt, sleep_before in enumerate((0.0,) + _LIST_RETRY_SLEEP_SECONDS, start=1):
