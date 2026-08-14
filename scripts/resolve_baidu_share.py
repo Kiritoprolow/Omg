@@ -52,7 +52,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
 
 import requests
 from baidupcs_py.baidupcs import BaiduPCSApi
@@ -1168,6 +1168,161 @@ def _send_callback(callback_url: str, webhook_secret: str, job_id: str, payload:
         logger.error("Gửi callback THẤT BẠI: %s", exc)
 
 
+def _list_personal_cloud_mp4s(
+    bduss: str, stoken: "str | None", bdstoken: Any, dest_dir: str,
+) -> list[str]:
+    """FIX VÒNG 2 (log thực tế 14/08/2026 — job chạy tiếp sau fix quét lại
+    Cloud cá nhân): bản đầu dùng `api.list(dest_dir, recursive=True)` —
+    NHƯNG method này của baidupcs-py 0.7.6 CŨNG gọi thẳng domain PCS CŨ
+    `pcs.baidu.com` (app_id=778750 hardcode cứng), domain đã bị Baidu khai
+    tử/chặn HOÀN TOÀN (y hệt lỗi đã fix ở `_resolve_download_links_via_rest_api`
+    cho `api.meta()`/`api.download_link()` — xem docstring hàm đó) -> 400
+    `error_code: 31023, message: 输入参数错误` cho MỌI lệnh gọi, kể cả `mkdir`.
+
+    Sửa: BỎ HẲN `api.list()`, tự gọi THẲNG REST API hiện đại
+    `pan.baidu.com/api/list` bằng `requests` — ĐÚNG domain (`pan.baidu.com`,
+    KHÔNG PHẢI `pcs.baidu.com`) + ĐÚNG `app_id=250528` đã CHỨNG MINH hoạt
+    động thật qua `transfer_shared_paths()` VÀ qua REST `/api/filemetas`
+    (cùng kiểu xác thực cookie BDUSS/STOKEN + bdstoken, không cần OAuth
+    access_token như domain PCS cũ). Đệ quy thủ công vào từng thư mục con
+    (không dùng `recursive=1` của endpoint này vì hành vi/giới hạn không rõ
+    ràng bằng tự đệ quy theo `isdir`).
+
+    FIX VÒNG 3 (log thực tế 14/08/2026 — GET /api/list trả HTTP 200,
+    errno=0, NHƯNG `list=[]` RỖNG dù transfer_shared_paths() vừa báo 192/200
+    fs_id THÀNH CÔNG ngay trước đó): 2 khả năng — (a) Baidu ghi file BẤT
+    ĐỒNG BỘ, transfer trả "thành công" nhưng file chưa kịp propagate lúc
+    list gần như NGAY SAU ĐÓ (batch cuối cùng còn báo error_code=4 "存储好
+    像出问题了" — storage đang có trục trặc thật lúc đó); (b) `app_id=250528`
+    có thể ghi file vào 1 thư mục SANDBOX riêng của app đó (dạng
+    `/我的应用数据/<tên app>/...`) thay vì đúng y absolute path `dest_dir`
+    yêu cầu — hành vi biết trước ở nhiều app-id bên thứ 3 trên Baidu Netdisk.
+
+    Sửa: (a) retry có backoff cho chính list ban đầu ở `dest_dir` (không
+    fail ngay nếu rỗng); (b) nếu retry hết vẫn rỗng, dump thêm listing thư
+    mục GỐC `/` để LẦN CHẠY TỚI biết CHÍNH XÁC file (nếu có) đang nằm ở đâu
+    -- kèm luôn vào message lỗi để không cần đoán mò vòng tiếp theo."""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://pan.baidu.com/disk/home",
+        "X-Requested-With": "XMLHttpRequest",
+    })
+    session.cookies.set("BDUSS", bduss, domain=".baidu.com")
+    if stoken:
+        session.cookies.set("STOKEN", stoken, domain=".baidu.com")
+
+    def _list_one_page(remote_dir: str, start: int, limit: int) -> tuple[list[dict], dict]:
+        params = {
+            "dir": remote_dir,
+            "order": "name",
+            "desc": "0",
+            "start": str(start),
+            "limit": str(limit),
+            "web": "1",
+            "channel": "chunlei",
+            "clienttype": "0",
+            "app_id": "250528",
+        }
+        if bdstoken:
+            params["bdstoken"] = bdstoken
+        try:
+            resp = session.get("https://pan.baidu.com/api/list", params=params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            raise BaiduDownloadError(
+                f"[REST] GET /api/list (dir={remote_dir!r}, start={start}) lỗi: {exc}"
+            ) from exc
+        errno = data.get("errno")
+        if errno not in (0, None):
+            raise BaiduDownloadError(
+                f"[REST] /api/list (dir={remote_dir!r}) trả errno={errno} (raw={data!r})"
+            )
+        return (data.get("list") or []), data
+
+    def _list_dir_recursive(remote_dir: str, mp4_paths: list[str], _depth: int = 0, _max_depth: int = 12) -> None:
+        if _depth > _max_depth:
+            logger.warning(
+                "[REST] Đã đệ quy quá %d cấp tại %s — dừng để tránh vòng lặp.",
+                _max_depth, remote_dir,
+            )
+            return
+        start = 0
+        limit = 1000
+        while True:
+            items, _raw = _list_one_page(remote_dir, start, limit)
+            for entry in items:
+                path = entry.get("path")
+                if not path:
+                    continue
+                if entry.get("isdir"):
+                    _list_dir_recursive(path, mp4_paths, _depth=_depth + 1, _max_depth=_max_depth)
+                elif Path(path).suffix.lower() == ".mp4":
+                    mp4_paths.append(path)
+            if len(items) < limit:
+                break
+            start += limit
+
+    logger.info(
+        "[REST] Quét lại Cloud cá nhân %s (SAU transfer, gọi TRỰC TIẾP "
+        "pan.baidu.com/api/list) để lấy path thật...", dest_dir,
+    )
+
+    # FIX VÒNG 3 phần (a) — retry có backoff cho khả năng Baidu ghi file bất
+    # đồng bộ (transfer báo "thành công" nhưng chưa propagate kịp).
+    _LIST_RETRY_SLEEP_SECONDS = (3.0, 6.0, 12.0)
+    mp4_paths: list[str] = []
+    top_level_raw: dict | None = None
+    for attempt, sleep_before in enumerate((0.0,) + _LIST_RETRY_SLEEP_SECONDS, start=1):
+        if sleep_before:
+            time.sleep(sleep_before)
+        mp4_paths = []
+        items, top_level_raw = _list_one_page(dest_dir, 0, 1000)
+        if items:
+            # Có item ở top-level -> tiếp tục đệ quy đầy đủ bình thường.
+            _list_dir_recursive(dest_dir, mp4_paths)
+            break
+        logger.warning(
+            "[REST] Lần %d: /api/list(dir=%r) trả list RỖNG (raw=%r) — có "
+            "thể Baidu ghi file bất đồng bộ, sẽ thử lại.",
+            attempt, dest_dir, top_level_raw,
+        )
+
+    if not mp4_paths:
+        # FIX VÒNG 3 phần (b) — retry hết vẫn rỗng -> dump listing thư mục
+        # gốc để lần chạy tới (hoặc ngay trong log lỗi này) biết CHÍNH XÁC
+        # file transfer thật ra nằm ở đâu (khả năng app_id=250528 ghi vào
+        # sandbox riêng thay vì đúng y `dest_dir`).
+        try:
+            root_items, root_raw = _list_one_page("/", 0, 1000)
+            root_names = [
+                (e.get("path"), bool(e.get("isdir"))) for e in root_items
+            ]
+        except Exception as exc:  # noqa: BLE001
+            root_names = [f"<lỗi list '/' để chẩn đoán: {exc}>"]
+        logger.error(
+            "[REST] KHÔNG tìm thấy file nào ở %s sau %d lần thử (kể cả retry). "
+            "Dump thư mục GỐC '/' trên Cloud cá nhân để chẩn đoán file transfer "
+            "thật ra nằm ở đâu: %s",
+            dest_dir, len(_LIST_RETRY_SLEEP_SECONDS) + 1, root_names,
+        )
+        raise BaiduDownloadError(
+            f"Quét lại {dest_dir} trên Cloud cá nhân KHÔNG thấy file .mp4 nào "
+            f"sau {len(_LIST_RETRY_SLEEP_SECONDS) + 1} lần thử (dù transfer báo "
+            f"thành công) — dump thư mục gốc '/': {root_names}"
+        )
+
+    logger.info(
+        "[REST] Quét lại %s -> tìm thấy %d file .mp4 THẬT trên Cloud cá nhân.",
+        dest_dir, len(mp4_paths),
+    )
+    return mp4_paths
+
+
 def _dump_download_link_diagnostics(api: "BaiduPCSApi") -> None:
     """CHẨN ĐOÁN (theo đúng pattern đã dùng ở `_dump_transfer_shared_paths_source`
     để fix `transfer_shared_paths` trước đây): log thực tế 13/08/2026 cho
@@ -1326,16 +1481,24 @@ def _resolve_download_links_via_rest_api(
     kiểu xác thực cookie BDUSS/STOKEN + bdstoken, không cần OAuth
     access_token như domain PCS cũ).
 
-    FIX VÒNG 6 (log 14/08/2026 — lần chạy NGAY SAU khi thêm REST API này):
-    request GET với 100 path/batch ăn `414 Request-URI Too Large` — tên
-    file tiếng Trung dài, encode URL nở ra gấp ~3 lần, x100 path nhét hết
-    vào QUERY STRING (`params=`) khiến URL dài hàng chục nghìn ký tự, vượt
-    giới hạn độ dài URI của server. Đổi hẳn sang **POST** — đưa `target`
-    (và toàn bộ tham số khác) vào BODY (`data=`) thay vì query string, độ
-    dài body request không bị giới hạn ngặt như URI. Giảm `batch_size`
-    xuống 30 để dự phòng thêm (dù về lý thuyết không còn giới hạn URL, batch
-    nhỏ hơn giúp lỗi cục bộ 1 phần không làm hỏng cả 1 batch lớn).
-    """
+    FIX VÒNG 6 (log thực tế 14/08/2026 — XÁC NHẬN qua log GH Actions lần
+    chạy sau vòng 5): batch cố định 100 path/request (vòng 5) khiến URL GET
+    dài TỚI HÀNG CHỤC NGHÌN KÝ TỰ khi path chứa nhiều ký tự CJK (mỗi ký tự
+    Hán/Trung sau url-encode nặng gấp ~9 lần, vd '妈' -> '%E5%A6%88') ->
+    Baidu trả `414 Request-URI Too Large` cho CẢ 2 batch (0/200 dlink resolve
+    được) -> rơi hẳn xuống fallback per-file (đã CHỨNG MINH luôn thất bại ở
+    vòng 5, xem docstring `_resolve_download_links`) -> BaiduDownloadError.
+
+    Sửa: CHIA BATCH THEO ĐỘ DÀI URL SAU KHI ENCODE (không còn theo SỐ LƯỢNG
+    path cố định) — cộng dồn độ dài `urllib.parse.quote()` của từng path,
+    cắt batch mới khi tổng vượt `_REST_FILEMETAS_MAX_QUERY_CHARS` (ngưỡng AN
+    TOÀN, thấp hơn nhiều so với giới hạn thực tế của server để chừa margin
+    cho các tham số khác + an toàn với server/proxy có ngưỡng thấp hơn
+    Chrome/Firefox mặc định ~8KB). Đề phòng ước lượng vẫn sai (server có
+    ngưỡng thấp hơn dự kiến), nếu vẫn dính 414 thì TỰ ĐỘNG CHẺ ĐÔI batch đó
+    và thử lại đệ quy tới khi mỗi batch chỉ còn 1 path (nếu 1 path vẫn 414,
+    bỏ qua path đó — path đơn lẻ 414 gần như không thể, nhưng vẫn không để
+    treo vô hạn)."""
     if not remote_paths:
         return {}
 
@@ -1347,23 +1510,18 @@ def _resolve_download_links_via_rest_api(
         ),
         "Referer": "https://pan.baidu.com/disk/home",
         "X-Requested-With": "XMLHttpRequest",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
     })
     session.cookies.set("BDUSS", bduss, domain=".baidu.com")
     if stoken:
         session.cookies.set("STOKEN", stoken, domain=".baidu.com")
 
     download_urls: dict[str, str] = {}
-    batch_size = 30  # POST nên không còn giới hạn độ dài URI, nhưng giữ batch vừa phải
-    for i in range(0, len(remote_paths), batch_size):
-        batch = remote_paths[i:i + batch_size]
-        # QUAN TRỌNG: `web`/`channel`/`clienttype`/`app_id`/`bdstoken` vẫn
-        # để trên QUERY STRING (params) như cũ — chỉ mỗi `target` (phần dài
-        # gây 414) chuyển xuống BODY (data). Endpoint pan.baidu.com chấp
-        # nhận kiểu trộn này (giống hệt cách `transfer_shared_paths` trong
-        # source đã dump: query string cho tham số ngắn, body cho dữ liệu
-        # dài như `fsidlist`).
-        query_params = {
+
+    def _fetch_batch(batch: list[str], label: str) -> None:
+        """Gọi 1 batch — nếu dính 414 (URL vẫn quá dài dù đã ước lượng),
+        CHẺ ĐÔI và thử lại đệ quy thay vì bỏ cuộc luôn cả batch."""
+        params = {
+            "target": json.dumps(batch, ensure_ascii=False),
             "dlink": "1",
             "web": "1",
             "channel": "chunlei",
@@ -1371,29 +1529,38 @@ def _resolve_download_links_via_rest_api(
             "app_id": "250528",
         }
         if bdstoken:
-            query_params["bdstoken"] = bdstoken
-        body_data = {"target": json.dumps(batch, ensure_ascii=False)}
+            params["bdstoken"] = bdstoken
         try:
-            resp = session.post(
-                "https://pan.baidu.com/api/filemetas",
-                params=query_params, data=body_data, timeout=30,
+            resp = session.get(
+                "https://pan.baidu.com/api/filemetas", params=params, timeout=30,
             )
+            if resp.status_code == 414 and len(batch) > 1:
+                mid = len(batch) // 2
+                logger.warning(
+                    "[REST] GET /api/filemetas (batch %s, %d path) vẫn dính "
+                    "414 dù đã ước lượng độ dài trước -> CHẺ ĐÔI thành 2 "
+                    "batch %d + %d path và thử lại.",
+                    label, len(batch), mid, len(batch) - mid,
+                )
+                _fetch_batch(batch[:mid], f"{label}a")
+                _fetch_batch(batch[mid:], f"{label}b")
+                return
             resp.raise_for_status()
             data = resp.json()
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "[REST] POST /api/filemetas (batch %d-%d/%d) lỗi request: %s",
-                i + 1, i + len(batch), len(remote_paths), exc,
+                "[REST] GET /api/filemetas (batch %s, %d path) lỗi request: %s",
+                label, len(batch), exc,
             )
-            continue
+            return
 
         errno = data.get("errno")
         if errno not in (0, None):
             logger.warning(
-                "[REST] /api/filemetas (batch %d-%d/%d) trả errno=%s (raw=%r)",
-                i + 1, i + len(batch), len(remote_paths), errno, data,
+                "[REST] /api/filemetas (batch %s, %d path) trả errno=%s (raw=%r)",
+                label, len(batch), errno, data,
             )
-            continue
+            return
 
         for entry in data.get("info") or []:
             path = entry.get("path")
@@ -1406,8 +1573,38 @@ def _resolve_download_links_via_rest_api(
                     "field 'dlink' (raw entry=%r)", path, entry,
                 )
 
+    # Ngưỡng AN TOÀN cho tổng độ dài các path ĐÃ URL-ENCODE trong 1 batch —
+    # để margin rộng cho phần params khác (dlink/web/channel/app_id/bdstoken/
+    # JSON list brackets+quotes+dấu phẩy) + an toàn với server/proxy có
+    # ngưỡng thấp hơn 8KB mặc định của trình duyệt.
+    _REST_FILEMETAS_MAX_QUERY_CHARS = 2000
+
+    batches: list[list[str]] = []
+    current_batch: list[str] = []
+    current_len = 0
+    for path in remote_paths:
+        encoded_len = len(quote(path, safe="")) + 3  # +3 cho dấu ngoặc kép + dấu phẩy trong JSON
+        if current_batch and current_len + encoded_len > _REST_FILEMETAS_MAX_QUERY_CHARS:
+            batches.append(current_batch)
+            current_batch = []
+            current_len = 0
+        current_batch.append(path)
+        current_len += encoded_len
+    if current_batch:
+        batches.append(current_batch)
+
     logger.info(
-        "[REST] POST /api/filemetas (gọi TRỰC TIẾP pan.baidu.com, KHÔNG qua "
+        "[REST] Chia %d path thành %d batch theo ĐỘ DÀI URL sau encode (ngưỡng "
+        "%d ký tự/batch — path chứa nhiều CJK nên KHÔNG chia đều theo số "
+        "lượng cố định như trước, để né lỗi 414 Request-URI Too Large).",
+        len(remote_paths), len(batches), _REST_FILEMETAS_MAX_QUERY_CHARS,
+    )
+
+    for idx, batch in enumerate(batches, start=1):
+        _fetch_batch(batch, f"{idx}/{len(batches)}")
+
+    logger.info(
+        "[REST] GET /api/filemetas (gọi TRỰC TIẾP pan.baidu.com, KHÔNG qua "
         "wrapper baidupcs-py) resolve được %d/%d dlink.",
         len(download_urls), len(remote_paths),
     )
@@ -1669,7 +1866,22 @@ def main() -> None:
         transferred_entries = [
             e for e in mp4_entries if getattr(e, "fs_id", None) not in skipped_fs_ids
         ]
-        saved_paths = [p for p in (_entry_path(e) for e in transferred_entries) if p]
+
+        # FIX (log thực tế 14/08/2026, xem docstring `_list_personal_cloud_mp4s`):
+        # KHÔNG dùng lại `_entry_path(e)` của `transferred_entries` nữa — đó là
+        # path TRONG SHARE CỦA NGƯỜI KHÁC (trước transfer), không tồn tại
+        # trong Cloud cá nhân -> resolve dlink 100% ra errno=-9. Phải quét lại
+        # `dest_dir` trên Cloud cá nhân SAU transfer để lấy path thật.
+        saved_paths = _list_personal_cloud_mp4s(bduss, stoken, root_bdstoken, dest_dir)
+        saved_paths.sort(key=lambda p: _natural_sort_key({"path": p}))
+
+        if not saved_paths:
+            raise BaiduDownloadError(
+                f"Transfer {drama_id} báo có kết quả nhưng quét lại {dest_dir} "
+                "trên Cloud cá nhân KHÔNG thấy file .mp4 nào — có thể transfer "
+                "thực ra thất bại hết, hoặc dest_dir bị lệch."
+            )
+
         if skipped_fs_ids:
             logger.warning(
                 "Transfer THÀNH CÔNG MỘT PHẦN — %d/%d file .mp4 đã lưu vào %s "
