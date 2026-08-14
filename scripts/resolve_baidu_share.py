@@ -1303,7 +1303,103 @@ def _resolve_single_download_link(api: "BaiduPCSApi", remote_path: str) -> "str 
     return None
 
 
-def _resolve_download_links(api: "BaiduPCSApi", remote_paths: list[str]) -> dict[str, str]:
+def _resolve_download_links_via_rest_api(
+    bduss: str, stoken: "str | None", bdstoken: Any, remote_paths: list[str],
+) -> dict[str, str]:
+    """
+    FIX VÒNG 5 (log 14/08/2026 — XÁC NHẬN CHẮC CHẮN qua log GH Actions):
+    `api.meta()` gọi thẳng `pcs.baidu.com/rest/2.0/pcs/file?method=meta`
+    (domain PCS CŨ, app_id=778750 hardcode cứng trong baidupcs-py 0.7.6) và
+    ăn HTTP 404 — domain `pcs.baidu.com` này đã bị Baidu khai tử/chặn HOÀN
+    TOÀN cho app_id mặc định của thư viện, không phân biệt endpoint
+    (meta/download đều 404 như nhau). `download_link(pcs=False)` nhiều khả
+    năng bên trong CŨNG phụ thuộc domain PCS cũ này để lấy metadata trước
+    khi build link -> luôn âm thầm trả `None` (baidupcs-py tự bắt lỗi,
+    không raise ra ngoài cho ta thấy).
+
+    Giải pháp: BỎ HẲN wrapper `api.meta()`/`api.download_link()` của
+    baidupcs-py cho bước resolve dlink — tự gọi THẲNG REST API hiện đại
+    `pan.baidu.com/api/filemetas?dlink=1` bằng `requests`, dùng ĐÚNG domain
+    (`pan.baidu.com`, KHÔNG PHẢI `pcs.baidu.com`) + ĐÚNG `app_id=250528` đã
+    CHỨNG MINH hoạt động thật qua `transfer_shared_paths()` (xem
+    `_dump_transfer_shared_paths_source` — cùng domain, cùng app_id, cùng
+    kiểu xác thực cookie BDUSS/STOKEN + bdstoken, không cần OAuth
+    access_token như domain PCS cũ).
+    """
+    if not remote_paths:
+        return {}
+
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://pan.baidu.com/disk/home",
+        "X-Requested-With": "XMLHttpRequest",
+    })
+    session.cookies.set("BDUSS", bduss, domain=".baidu.com")
+    if stoken:
+        session.cookies.set("STOKEN", stoken, domain=".baidu.com")
+
+    download_urls: dict[str, str] = {}
+    batch_size = 100  # tránh URL/query quá dài khi target là JSON list path
+    for i in range(0, len(remote_paths), batch_size):
+        batch = remote_paths[i:i + batch_size]
+        params = {
+            "target": json.dumps(batch, ensure_ascii=False),
+            "dlink": "1",
+            "web": "1",
+            "channel": "chunlei",
+            "clienttype": "0",
+            "app_id": "250528",
+        }
+        if bdstoken:
+            params["bdstoken"] = bdstoken
+        try:
+            resp = session.get(
+                "https://pan.baidu.com/api/filemetas", params=params, timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[REST] GET /api/filemetas (batch %d-%d/%d) lỗi request: %s",
+                i + 1, i + len(batch), len(remote_paths), exc,
+            )
+            continue
+
+        errno = data.get("errno")
+        if errno not in (0, None):
+            logger.warning(
+                "[REST] /api/filemetas (batch %d-%d/%d) trả errno=%s (raw=%r)",
+                i + 1, i + len(batch), len(remote_paths), errno, data,
+            )
+            continue
+
+        for entry in data.get("info") or []:
+            path = entry.get("path")
+            dlink = entry.get("dlink")
+            if path and dlink:
+                download_urls[path] = dlink
+            elif path:
+                logger.warning(
+                    "[REST] /api/filemetas trả entry cho '%s' nhưng KHÔNG có "
+                    "field 'dlink' (raw entry=%r)", path, entry,
+                )
+
+    logger.info(
+        "[REST] GET /api/filemetas (gọi TRỰC TIẾP pan.baidu.com, KHÔNG qua "
+        "wrapper baidupcs-py) resolve được %d/%d dlink.",
+        len(download_urls), len(remote_paths),
+    )
+    return download_urls
+
+
+def _resolve_download_links(
+    api: "BaiduPCSApi", remote_paths: list[str],
+    bduss: str, stoken: "str | None", bdstoken: Any,
+) -> dict[str, str]:
     """
     FIX (log thực tế 13/08/2026): HF Space gọi `api.download_link()` LOCAL
     để lấy direct-link CDN cho từng file sau khi GH Actions đã transfer xong
@@ -1319,21 +1415,34 @@ def _resolve_download_links(api: "BaiduPCSApi", remote_paths: list[str]) -> dict
     khác cơ chế chặn so với API pan.baidu.com), chỉ cần đúng cookie xác
     thực để CDN chấp nhận request.
 
-    FIX VÒNG 3 (log 13/08/2026, sau khi diagnostic dump CUỐI CÙNG lộ ra
-    signature thật): API đúng là `api.download_link(remotepath, pcs=False)
-    -> Optional[str]` — vòng 1/2 đoán sai tên (`download_url`/`dlink`/...)
-    HOẶC gọi đúng tên nhưng để mặc định `pcs=False` khiến nó âm thầm trả
-    `None` cho các file vừa transfer xong. Giờ gọi ĐÚNG tên, thử cả
-    `pcs=False` và `pcs=True`. Batch qua `api.meta(*remotepaths)` (method có
-    thật, xác nhận qua diagnostic) được thử trước để tiết kiệm request,
-    nhưng không đảm bảo PcsFile mang sẵn dlink -> luôn có fallback per-file
-    bằng `download_link()` cho phần chưa resolve được.
+    FIX VÒNG 5 (QUAN TRỌNG NHẤT — log 14/08/2026 xác nhận qua GH Actions log):
+    `api.meta()`/`api.download_link()` của baidupcs-py 0.7.6 ĐỀU phụ thuộc
+    domain PCS cũ `pcs.baidu.com` (app_id=778750 hardcode) — domain này đã
+    bị Baidu khai tử/chặn HOÀN TOÀN, luôn 404 bất kể endpoint gì. Ưu tiên
+    dùng THẲNG `_resolve_download_links_via_rest_api()` (gọi trực tiếp
+    `pan.baidu.com/api/filemetas?dlink=1`, đúng domain/app_id đã chứng minh
+    hoạt động qua `transfer_shared_paths`). Chỉ khi cách này thất bại/thiếu
+    file mới rơi xuống các cách cũ qua baidupcs-py (batch `meta()` + per-file
+    `download_link()`) như lưới an toàn cuối, dù xác suất thành công thấp.
     """
     _dump_download_link_diagnostics(api)
 
-    batch_result = _resolve_download_links_batch(api, remote_paths)
-    download_urls: dict[str, str] = dict(batch_result) if batch_result else {}
+    download_urls = _resolve_download_links_via_rest_api(bduss, stoken, bdstoken, remote_paths)
     missing = [p for p in remote_paths if p not in download_urls]
+    if not missing:
+        return download_urls
+
+    logger.warning(
+        "[REST] Còn %d/%d file chưa resolve được qua REST API trực tiếp — "
+        "thử fallback qua wrapper baidupcs-py (xác suất thành công thấp, "
+        "xem docstring `_resolve_download_links`).",
+        len(missing), len(remote_paths),
+    )
+
+    batch_result = _resolve_download_links_batch(api, missing)
+    if batch_result:
+        download_urls.update(batch_result)
+    missing = [p for p in missing if p not in download_urls]
 
     for remote_path in missing:
         url = _resolve_single_download_link(api, remote_path)
@@ -1341,9 +1450,9 @@ def _resolve_download_links(api: "BaiduPCSApi", remote_paths: list[str]) -> dict
             download_urls[remote_path] = url
         else:
             logger.warning(
-                "KHÔNG resolve được dlink cho '%s' (đã thử api.meta() + "
-                "api.download_link(pcs=False/True)) — file này sẽ bị BỎ "
-                "QUA ở HF Space.",
+                "KHÔNG resolve được dlink cho '%s' (đã thử REST API trực "
+                "tiếp + api.meta() + api.download_link(pcs=False)) — file "
+                "này sẽ bị BỎ QUA ở HF Space.",
                 remote_path,
             )
     logger.info(
@@ -1561,7 +1670,9 @@ def main() -> None:
         # `_resolve_download_links`) — file nào không lấy được dlink bị loại
         # khỏi `saved_paths` cuối cùng luôn, để HF Space không tưởng nhầm là
         # "đã lưu" nhưng thật ra không có URL để tải.
-        download_urls = _resolve_download_links(api, saved_paths)
+        download_urls = _resolve_download_links(
+            api, saved_paths, bduss=bduss, stoken=stoken, bdstoken=root_bdstoken,
+        )
         saved_paths = [p for p in saved_paths if p in download_urls]
         if not saved_paths:
             raise BaiduDownloadError(
