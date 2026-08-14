@@ -1265,30 +1265,41 @@ def _resolve_download_links_batch(api: "BaiduPCSApi", remote_paths: list[str]) -
 
 
 def _resolve_single_download_link(api: "BaiduPCSApi", remote_path: str) -> "str | None":
-    """FIX ĐÚNG THEO DIAGNOSTIC DUMP 13/08/2026 (2 lần chạy trước đoán sai
-    tên method / để mặc định `pcs=False` khiến API trả `None` âm thầm,
-    không raise exception nên không log được lý do cụ thể):
+    """FIX VÒNG 4 (log thực tế 14/08/2026): vòng trước thử CẢ `pcs=False` VÀ
+    `pcs=True` — kết quả 200/200 "resolve thành công" nhưng TOÀN BỘ URL cuối
+    cùng dùng đều là dạng `c.pcs.baidu.com/rest/2.0/pcs/file?method=download
+    &app_id=778750...` (dạng PCS OpenAPI CŨ) -> tải 404 100%. Endpoint PCS cũ
+    này cần xác thực bằng `access_token` OAuth2 CHỨ KHÔNG PHẢI cookie
+    BDUSS/STOKEN mà toàn bộ hệ thống đang dùng để đăng nhập -> `pcs=True`
+    KHÔNG BAO GIỜ hoạt động được với kiểu đăng nhập hiện tại, dù trả về
+    "url" (url đó vô dụng, luôn 404 khi tải).
 
-        api.download_link(remotepath: str, pcs: bool = False) -> Optional[str]
-
-    Method NÀY đã tồn tại và ĐÃ được gọi ở 2 lần fix trước — nhưng luôn trả
-    `None` với `pcs=False` (mặc định) cho các file vừa `transfer_shared_paths`
-    xong. Giờ thử CẢ 2 giá trị: `pcs=False` trước (giữ hành vi/luồng share
-    API mới), rồi `pcs=True` (luồng PCS API cũ) nếu vẫn `None` — không raise
-    ở tầng này, chỉ trả `None` để tầng gọi tự log."""
+    Bỏ hẳn nhánh `pcs=True` — CHỈ dùng `pcs=False` (luồng share API mới,
+    tương thích cookie BDUSS). Nếu `pcs=False` trả `None`/rỗng (không
+    raise), log RÕ RÀNG ngay tại đây (khác bản trước — bản trước im lặng
+    nếu không có exception, khiến không biết pcs=False có thật sự được gọi
+    hay không) để log GH Actions lần chạy tới cho biết CHÍNH XÁC nguyên
+    nhân — không đoán mò vòng 5."""
     fn = getattr(api, "download_link", None)
     if not callable(fn):
+        logger.warning("api.download_link không tồn tại trên object api.")
         return None
-    for pcs_flag in (False, True):
-        try:
-            url = fn(remote_path, pcs=pcs_flag)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "api.download_link('%s', pcs=%s) lỗi: %s", remote_path, pcs_flag, exc,
-            )
-            continue
-        if url:
-            return url
+    try:
+        url = fn(remote_path, pcs=False)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "api.download_link('%s', pcs=False) RAISE exception: %s",
+            remote_path, exc,
+        )
+        return None
+    if url:
+        return url
+    logger.warning(
+        "api.download_link('%s', pcs=False) trả về giá trị RỖNG/None "
+        "(KHÔNG raise exception) — đây là toàn bộ thông tin có được, "
+        "baidupcs-py không cho biết lý do cụ thể hơn ở tầng này.",
+        remote_path,
+    )
     return None
 
 
