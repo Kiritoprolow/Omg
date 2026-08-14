@@ -52,7 +52,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
 
 import requests
 from baidupcs_py.baidupcs import BaiduPCSApi
@@ -1325,7 +1325,25 @@ def _resolve_download_links_via_rest_api(
     `_dump_transfer_shared_paths_source` — cùng domain, cùng app_id, cùng
     kiểu xác thực cookie BDUSS/STOKEN + bdstoken, không cần OAuth
     access_token như domain PCS cũ).
-    """
+
+    FIX VÒNG 6 (log thực tế 14/08/2026 — XÁC NHẬN qua log GH Actions lần
+    chạy sau vòng 5): batch cố định 100 path/request (vòng 5) khiến URL GET
+    dài TỚI HÀNG CHỤC NGHÌN KÝ TỰ khi path chứa nhiều ký tự CJK (mỗi ký tự
+    Hán/Trung sau url-encode nặng gấp ~9 lần, vd '妈' -> '%E5%A6%88') ->
+    Baidu trả `414 Request-URI Too Large` cho CẢ 2 batch (0/200 dlink resolve
+    được) -> rơi hẳn xuống fallback per-file (đã CHỨNG MINH luôn thất bại ở
+    vòng 5, xem docstring `_resolve_download_links`) -> BaiduDownloadError.
+
+    Sửa: CHIA BATCH THEO ĐỘ DÀI URL SAU KHI ENCODE (không còn theo SỐ LƯỢNG
+    path cố định) — cộng dồn độ dài `urllib.parse.quote()` của từng path,
+    cắt batch mới khi tổng vượt `_REST_FILEMETAS_MAX_QUERY_CHARS` (ngưỡng AN
+    TOÀN, thấp hơn nhiều so với giới hạn thực tế của server để chừa margin
+    cho các tham số khác + an toàn với server/proxy có ngưỡng thấp hơn
+    Chrome/Firefox mặc định ~8KB). Đề phòng ước lượng vẫn sai (server có
+    ngưỡng thấp hơn dự kiến), nếu vẫn dính 414 thì TỰ ĐỘNG CHẺ ĐÔI batch đó
+    và thử lại đệ quy tới khi mỗi batch chỉ còn 1 path (nếu 1 path vẫn 414,
+    bỏ qua path đó — path đơn lẻ 414 gần như không thể, nhưng vẫn không để
+    treo vô hạn)."""
     if not remote_paths:
         return {}
 
@@ -1343,9 +1361,10 @@ def _resolve_download_links_via_rest_api(
         session.cookies.set("STOKEN", stoken, domain=".baidu.com")
 
     download_urls: dict[str, str] = {}
-    batch_size = 100  # tránh URL/query quá dài khi target là JSON list path
-    for i in range(0, len(remote_paths), batch_size):
-        batch = remote_paths[i:i + batch_size]
+
+    def _fetch_batch(batch: list[str], label: str) -> None:
+        """Gọi 1 batch — nếu dính 414 (URL vẫn quá dài dù đã ước lượng),
+        CHẺ ĐÔI và thử lại đệ quy thay vì bỏ cuộc luôn cả batch."""
         params = {
             "target": json.dumps(batch, ensure_ascii=False),
             "dlink": "1",
@@ -1360,22 +1379,33 @@ def _resolve_download_links_via_rest_api(
             resp = session.get(
                 "https://pan.baidu.com/api/filemetas", params=params, timeout=30,
             )
+            if resp.status_code == 414 and len(batch) > 1:
+                mid = len(batch) // 2
+                logger.warning(
+                    "[REST] GET /api/filemetas (batch %s, %d path) vẫn dính "
+                    "414 dù đã ước lượng độ dài trước -> CHẺ ĐÔI thành 2 "
+                    "batch %d + %d path và thử lại.",
+                    label, len(batch), mid, len(batch) - mid,
+                )
+                _fetch_batch(batch[:mid], f"{label}a")
+                _fetch_batch(batch[mid:], f"{label}b")
+                return
             resp.raise_for_status()
             data = resp.json()
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "[REST] GET /api/filemetas (batch %d-%d/%d) lỗi request: %s",
-                i + 1, i + len(batch), len(remote_paths), exc,
+                "[REST] GET /api/filemetas (batch %s, %d path) lỗi request: %s",
+                label, len(batch), exc,
             )
-            continue
+            return
 
         errno = data.get("errno")
         if errno not in (0, None):
             logger.warning(
-                "[REST] /api/filemetas (batch %d-%d/%d) trả errno=%s (raw=%r)",
-                i + 1, i + len(batch), len(remote_paths), errno, data,
+                "[REST] /api/filemetas (batch %s, %d path) trả errno=%s (raw=%r)",
+                label, len(batch), errno, data,
             )
-            continue
+            return
 
         for entry in data.get("info") or []:
             path = entry.get("path")
@@ -1387,6 +1417,36 @@ def _resolve_download_links_via_rest_api(
                     "[REST] /api/filemetas trả entry cho '%s' nhưng KHÔNG có "
                     "field 'dlink' (raw entry=%r)", path, entry,
                 )
+
+    # Ngưỡng AN TOÀN cho tổng độ dài các path ĐÃ URL-ENCODE trong 1 batch —
+    # để margin rộng cho phần params khác (dlink/web/channel/app_id/bdstoken/
+    # JSON list brackets+quotes+dấu phẩy) + an toàn với server/proxy có
+    # ngưỡng thấp hơn 8KB mặc định của trình duyệt.
+    _REST_FILEMETAS_MAX_QUERY_CHARS = 2000
+
+    batches: list[list[str]] = []
+    current_batch: list[str] = []
+    current_len = 0
+    for path in remote_paths:
+        encoded_len = len(quote(path, safe="")) + 3  # +3 cho dấu ngoặc kép + dấu phẩy trong JSON
+        if current_batch and current_len + encoded_len > _REST_FILEMETAS_MAX_QUERY_CHARS:
+            batches.append(current_batch)
+            current_batch = []
+            current_len = 0
+        current_batch.append(path)
+        current_len += encoded_len
+    if current_batch:
+        batches.append(current_batch)
+
+    logger.info(
+        "[REST] Chia %d path thành %d batch theo ĐỘ DÀI URL sau encode (ngưỡng "
+        "%d ký tự/batch — path chứa nhiều CJK nên KHÔNG chia đều theo số "
+        "lượng cố định như trước, để né lỗi 414 Request-URI Too Large).",
+        len(remote_paths), len(batches), _REST_FILEMETAS_MAX_QUERY_CHARS,
+    )
+
+    for idx, batch in enumerate(batches, start=1):
+        _fetch_batch(batch, f"{idx}/{len(batches)}")
 
     logger.info(
         "[REST] GET /api/filemetas (gọi TRỰC TIẾP pan.baidu.com, KHÔNG qua "
