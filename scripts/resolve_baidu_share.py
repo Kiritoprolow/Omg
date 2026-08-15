@@ -1800,60 +1800,89 @@ def main() -> None:
         api = BaiduPCSApi(bduss=bduss, stoken=stoken or None)
 
         # ------------------------------------------------------------- #
-        # BƯỚC 1 (nếu có passcode) — access_shared() để verify passcode và
-        # set cookie BDCLND. THIẾU bước này là lý do gốc shared_paths()
-        # luôn trả về rỗng ở mọi lần thử trước.
+        # BƯỚC 1+2 (nếu có passcode) — access_shared() verify passcode + set
+        # cookie BDCLND, rồi shared_paths(). BỌC CẢ CỤM trong retry loop:
+        #
+        # FIX VÒNG 6 (log thực tế 15/08/2026 — job PASSCODE ĐÚNG, các lần
+        # chạy khác cùng ngày với share khác đều xanh, nhưng THỈNH THOẢNG 1
+        # job dính đúng AssertionError "Don't get shared info" với chẩn đoán
+        # cụ thể là "TRANG YÊU CẦU NHẬP LẠI PASSCODE — cookie BDCLND chưa
+        # set được"): access_shared() (POST /share/verify) trả 200 nhưng
+        # baidupcs-py KHÔNG check errno trong response, nên nếu Baidu occasionally
+        # từ chối verify (rate-limit tạm thời, cookie chưa kịp propagate, hoặc
+        # 1 lỗi thoáng qua phía Baidu) — code không hề biết, cứ đi tiếp qua
+        # shared_paths() rồi mới vỡ lẽ. Vì đây là lỗi chỉ THỈNH THOẢNG xảy ra
+        # (không phải link chết cố định), khả năng cao là TẠM THỜI — verify
+        # lại từ đầu (gọi lại access_shared() rồi shared_paths()) thường sẽ
+        # qua ngay ở lần thử kế tiếp.
         # ------------------------------------------------------------- #
-        if passcode:
-            logger.info("Verify passcode qua access_shared() (set cookie BDCLND)...")
+        _SHARE_VERIFY_MAX_ATTEMPTS = 3
+        _SHARE_VERIFY_RETRY_SLEEP_SECONDS = (5.0, 15.0)
+        shared_paths = None
+        for verify_attempt in range(1, _SHARE_VERIFY_MAX_ATTEMPTS + 1):
+            if passcode:
+                logger.info(
+                    "Verify passcode qua access_shared() (set cookie BDCLND) — "
+                    "lần thử %d/%d...", verify_attempt, _SHARE_VERIFY_MAX_ATTEMPTS,
+                )
+                try:
+                    access_result = _call_access_shared(api, share_url, passcode)
+                    logger.debug("RAW access_shared(): %r", access_result)
+                except Exception as exc:  # noqa: BLE001
+                    errno, errmsg = _extract_errno_errmsg(exc)
+                    logger.error(
+                        "access_shared(%s) raise exception — errno=%s errmsg=%s raw=%r",
+                        share_url, errno, errmsg, exc,
+                    )
+                    if _looks_like_captcha_or_cookie_issue(exc):
+                        raise RuntimeError(
+                            f"access_shared() lỗi nghi do sai passcode, CAPTCHA/mã "
+                            f"xác minh, hoặc Cookie BDUSS/STOKEN đã hết hạn: {exc}"
+                        ) from exc
+                    raise
+            else:
+                logger.info("Link không có passcode — bỏ qua bước access_shared().")
+
             try:
-                access_result = _call_access_shared(api, share_url, passcode)
-                logger.debug("RAW access_shared(): %r", access_result)
+                shared_paths = api.shared_paths(share_url)
+                break  # thành công -> thoát retry loop
             except Exception as exc:  # noqa: BLE001
                 errno, errmsg = _extract_errno_errmsg(exc)
                 logger.error(
-                    "access_shared(%s) raise exception — errno=%s errmsg=%s raw=%r",
-                    share_url, errno, errmsg, exc,
+                    "shared_paths(%s) raise exception (lần thử %d/%d) — errno=%s "
+                    "errmsg=%s raw=%r",
+                    share_url, verify_attempt, _SHARE_VERIFY_MAX_ATTEMPTS, errno, errmsg, exc,
                 )
+                if isinstance(exc, AssertionError) and "shared info" in str(exc).lower():
+                    # FIX (log thực tế 14/08/2026, xem docstring
+                    # `_diagnose_shared_info_assertion`): AssertionError trần
+                    # trụi không cho biết vì sao — tự GET lại trang share để
+                    # tìm lý do CỤ THỂ trước khi raise/retry.
+                    reason = _diagnose_shared_info_assertion(bduss, stoken, share_url)
+                    logger.error("[CHẨN ĐOÁN] Lý do khả dĩ khiến shared_paths() không lấy được shared info: %s", reason)
+                    if verify_attempt < _SHARE_VERIFY_MAX_ATTEMPTS and passcode:
+                        sleep_s = _SHARE_VERIFY_RETRY_SLEEP_SECONDS[
+                            min(verify_attempt - 1, len(_SHARE_VERIFY_RETRY_SLEEP_SECONDS) - 1)
+                        ]
+                        logger.warning(
+                            "Nghi verify passcode bị lỗi TẠM THỜI (không phải link "
+                            "chết) — nghỉ %.0fs rồi verify+fetch lại từ đầu (lần "
+                            "%d/%d).", sleep_s, verify_attempt + 1, _SHARE_VERIFY_MAX_ATTEMPTS,
+                        )
+                        time.sleep(sleep_s)
+                        continue
+                    raise RuntimeError(
+                        f"shared_paths() không lấy được thông tin share sau "
+                        f"{verify_attempt} lần thử (trang share không chứa data "
+                        f"như mong đợi). Chẩn đoán: {reason}"
+                    ) from exc
                 if _looks_like_captcha_or_cookie_issue(exc):
                     raise RuntimeError(
-                        f"access_shared() lỗi nghi do sai passcode, CAPTCHA/mã "
-                        f"xác minh, hoặc Cookie BDUSS/STOKEN đã hết hạn: {exc}"
+                        f"shared_paths() lỗi nghi do CAPTCHA/mã xác minh hoặc "
+                        f"Cookie BDUSS/STOKEN đã hết hạn: {exc}"
                     ) from exc
                 raise
-        else:
-            logger.info("Link không có passcode — bỏ qua bước access_shared().")
 
-        # ------------------------------------------------------------- #
-        # BƯỚC 2 — shared_paths(). Sau khi access_shared() đã set cookie
-        # BDCLND (nếu có passcode), lệnh này giờ mới có thể trả đúng danh
-        # sách file thay vì rỗng.
-        # ------------------------------------------------------------- #
-        try:
-            shared_paths = api.shared_paths(share_url)
-        except Exception as exc:  # noqa: BLE001
-            errno, errmsg = _extract_errno_errmsg(exc)
-            logger.error(
-                "shared_paths(%s) raise exception — errno=%s errmsg=%s raw=%r",
-                share_url, errno, errmsg, exc,
-            )
-            if isinstance(exc, AssertionError) and "shared info" in str(exc).lower():
-                # FIX (log thực tế 14/08/2026, xem docstring
-                # `_diagnose_shared_info_assertion`): AssertionError trần
-                # trụi không cho biết vì sao — tự GET lại trang share để
-                # tìm lý do CỤ THỂ trước khi raise.
-                reason = _diagnose_shared_info_assertion(bduss, stoken, share_url)
-                logger.error("[CHẨN ĐOÁN] Lý do khả dĩ khiến shared_paths() không lấy được shared info: %s", reason)
-                raise RuntimeError(
-                    f"shared_paths() không lấy được thông tin share (trang share "
-                    f"không chứa data như mong đợi). Chẩn đoán: {reason}"
-                ) from exc
-            if _looks_like_captcha_or_cookie_issue(exc):
-                raise RuntimeError(
-                    f"shared_paths() lỗi nghi do CAPTCHA/mã xác minh hoặc "
-                    f"Cookie BDUSS/STOKEN đã hết hạn: {exc}"
-                ) from exc
-            raise
 
         logger.debug("RAW shared_paths(): %r", shared_paths)
 
