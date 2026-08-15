@@ -236,6 +236,31 @@ def _derive_flat_drama_id(share_url: str) -> str:
     return f"flat:{hashlib.md5(clean.encode('utf-8')).hexdigest()[:12]}"
 
 
+def _looks_like_container_folder(
+    children: list[Any], min_dir_count: int = 5, min_dir_ratio: float = 0.6,
+) -> bool:
+    """FIX VÒNG 5 (phát hiện qua log thực tế 14/08/2026 — drama_id='8月14日
+    更新' LIÊN TỤC kích HARD CAP 6920 file .mp4/1 "bộ phim"): 1 số entry ở
+    CẤP GỐC của share KHÔNG PHẢI là 1 bộ phim đơn lẻ, mà là 1 THƯ MỤC GỘP
+    THEO NGÀY chứa hàng chục/hàng trăm bộ phim con bên trong (VD:
+    "8月14日更新" chứa "99.xxx（61集）", "98.xxx（104集）", ... — mỗi thư mục
+    con MỚI thực sự là 1 bộ phim, đã xác nhận qua log: list_shared_paths()
+    của riêng "99.公会恶鬼之牙第一季（61集）" trả về đúng 64 item con TOÀN
+    file .mp4, không có thư mục con nào nữa).
+
+    Heuristic: nếu phần lớn item con là THƯ MỤC (không phải file .mp4 lẻ)
+    VÀ số lượng thư mục con đủ nhiều (>= `min_dir_count`), coi đây là
+    container gộp cần đào sâu thêm 1 cấp, KHÔNG coi cả container là 1 "bộ
+    phim". Một bộ phim thật (kể cả có 1-2 folder mùa/season con) sẽ KHÔNG
+    khớp ngưỡng này vì tuyệt đại đa số item con của nó là file .mp4."""
+    if not children:
+        return False
+    dir_children = [c for c in children if _entry_is_dir(c)]
+    if len(dir_children) < min_dir_count:
+        return False
+    return (len(dir_children) / len(children)) >= min_dir_ratio
+
+
 def _pick_unprocessed_entry(
     entries: list[Any], processed_drama_ids: "set[str] | frozenset[str]",
 ) -> "tuple[Any, str] | tuple[None, None]":
@@ -1342,6 +1367,53 @@ def _list_personal_cloud_mp4s(
     return mp4_paths
 
 
+def _diagnose_shared_info_assertion(bduss: str, stoken: "str | None", share_url: str) -> str:
+    """FIX (log thực tế 14/08/2026 — `AssertionError: 'BaiduPCS.shared_paths':
+    Don't get shared info`): lỗi này nghĩa là baidupcs-py GET trang share về
+    parse HTML tìm 1 JS data blob nhưng KHÔNG THẤY (`assert m` fail) — mà
+    KHÔNG kèm lý do. `access_shared()` (verify passcode) đứng trước đó lại
+    LUÔN trả về `None` bất kể passcode ĐÚNG hay SAI (baidupcs-py không check
+    `errno` trong response `/share/verify`, không raise khi sai passcode) —
+    nên tới bước này ta hoàn toàn không biết vì sao.
+
+    Hàm này tự GET LẠI trang share bằng `requests` trần (bỏ qua wrapper) rồi
+    quét các cụm lỗi tiếng Trung quen thuộc của Baidu để trả về lý do CỤ THỂ
+    thay vì để lộ ra ngoài đúng cái AssertionError khó hiểu kia. Trả về
+    chuỗi mô tả nguyên nhân khả dĩ nhất (không raise — caller tự quyết định
+    raise gì)."""
+    try:
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+        })
+        session.cookies.set("BDUSS", bduss, domain=".baidu.com")
+        if stoken:
+            session.cookies.set("STOKEN", stoken, domain=".baidu.com")
+        resp = session.get(share_url, timeout=30)
+        html = resp.text
+    except Exception as exc:  # noqa: BLE001
+        return f"(không GET lại được trang share để chẩn đoán thêm: {exc})"
+
+    signatures = [
+        ("提取码错误", "PASSCODE SAI (提取码错误) — kiểm tra lại PASSCODE truyền vào job."),
+        ("分享的文件已经被取消", "SHARE ĐÃ BỊ HUỶ bởi chủ share (分享的文件已经被取消)."),
+        ("您访问的页面不存在", "LINK SHARE KHÔNG TỒN TẠI/SAI (您访问的页面不存在)."),
+        ("分享已过期", "SHARE ĐÃ HẾT HẠN (分享已过期)."),
+        ("请输入提取码", "TRANG YÊU CẦU NHẬP LẠI PASSCODE (verify chưa set được cookie BDCLND — 请输入提取码)."),
+        ("异常访问", "BAIDU CHẶN DO TRUY CẬP BẤT THƯỜNG (异常访问 — nghi ngờ BDUSS/STOKEN bị flag/rate-limit)."),
+        ("login", "TRANG TRẢ VỀ LÀ TRANG LOGIN — BAIDU_BDUSS/BAIDU_STOKEN nhiều khả năng đã hết hạn."),
+    ]
+    for needle, explanation in signatures:
+        if needle in html:
+            return explanation
+
+    snippet = re.sub(r"\s+", " ", html)[:300]
+    return f"(không khớp mẫu lỗi quen thuộc nào — trích 300 ký tự đầu trang trả về để chẩn đoán thủ công: {snippet!r})"
+
+
 def _dump_download_link_diagnostics(api: "BaiduPCSApi") -> None:
     """CHẨN ĐOÁN (theo đúng pattern đã dùng ở `_dump_transfer_shared_paths_source`
     để fix `transfer_shared_paths` trước đây): log thực tế 13/08/2026 cho
@@ -1765,6 +1837,17 @@ def main() -> None:
                 "shared_paths(%s) raise exception — errno=%s errmsg=%s raw=%r",
                 share_url, errno, errmsg, exc,
             )
+            if isinstance(exc, AssertionError) and "shared info" in str(exc).lower():
+                # FIX (log thực tế 14/08/2026, xem docstring
+                # `_diagnose_shared_info_assertion`): AssertionError trần
+                # trụi không cho biết vì sao — tự GET lại trang share để
+                # tìm lý do CỤ THỂ trước khi raise.
+                reason = _diagnose_shared_info_assertion(bduss, stoken, share_url)
+                logger.error("[CHẨN ĐOÁN] Lý do khả dĩ khiến shared_paths() không lấy được shared info: %s", reason)
+                raise RuntimeError(
+                    f"shared_paths() không lấy được thông tin share (trang share "
+                    f"không chứa data như mong đợi). Chẩn đoán: {reason}"
+                ) from exc
             if _looks_like_captcha_or_cookie_issue(exc):
                 raise RuntimeError(
                     f"shared_paths() lỗi nghi do CAPTCHA/mã xác minh hoặc "
@@ -1822,9 +1905,60 @@ def main() -> None:
                 "file .mp4 (KHÔNG transfer nguyên fs_id thư mục mẹ)...",
                 drama_id, _entry_path(chosen_entry),
             )
+
+            # FIX VÒNG 5 (xem docstring `_looks_like_container_folder`) —
+            # peek trước children của chosen_entry: nếu đây là container gộp
+            # theo ngày (chứa hàng chục bộ phim con) chứ KHÔNG PHẢI 1 bộ
+            # phim đơn lẻ, đào sâu thêm 1 cấp và chọn 1 bộ phim CON thật sự
+            # bên trong — TRÁNH transfer lẫn lộn fs_id của nhiều bộ phim
+            # khác nhau + tránh container bị kẹt "chưa xử lý xong" vĩnh viễn
+            # (vì luôn lỗi do HARD CAP/dữ liệu lẫn lộn, không bao giờ được
+            # đánh dấu processed, nên bị chọn lại lặp vô hạn, 90+ bộ phim
+            # con còn lại bên trong sẽ KHÔNG BAO GIỜ được tải).
+            probe_children = _call_list_shared_paths(
+                api, chosen_entry, root_uk, root_share_id, root_bdstoken, share_url,
+            )
+            if probe_children and _looks_like_container_folder(probe_children):
+                container_name = drama_id
+                inner_dir_entries = [c for c in probe_children if _entry_is_dir(c)]
+                logger.warning(
+                    "[CONTAINER] '%s' trông giống THƯ MỤC GỘP THEO NGÀY chứa %d "
+                    "bộ phim con (không phải 1 bộ phim đơn lẻ) — đào sâu thêm 1 "
+                    "cấp, chọn 1 bộ phim con THẬT bên trong thay vì transfer lẫn "
+                    "lộn nguyên cả container.",
+                    container_name, len(inner_dir_entries),
+                )
+                # drama_id ghép "container/con" để dedup ĐÚNG từng bộ phim con
+                # riêng biệt qua nhiều lần chạy job — LƯU Ý: HF Space cần lưu
+                # + gửi lại đúng NGUYÊN VĂN chuỗi này trong PROCESSED_DRAMA_IDS
+                # (chỉ cần coi là chuỗi id bất kỳ, không cần parse ý nghĩa).
+                inner_candidates = [
+                    (c, f"{container_name}/{_entry_filename(c)}")
+                    for c in inner_dir_entries if _entry_filename(c)
+                ]
+                inner_unprocessed = [
+                    (c, cid) for c, cid in inner_candidates if cid not in processed_drama_ids
+                ]
+                if not inner_unprocessed:
+                    logger.info(
+                        "Toàn bộ %d bộ phim con trong container '%s' đã có trong "
+                        "processed_drama_ids — không còn gì mới để chọn trong "
+                        "container này.", len(inner_candidates), container_name,
+                    )
+                    _send_callback(
+                        callback_url, webhook_secret, job_id, {"status": "all_processed"},
+                    )
+                    return
+                chosen_entry, drama_id = random.choice(inner_unprocessed)
+                logger.info(
+                    "Đã chọn bộ phim con drama_id='%s' bên trong container "
+                    "'%s' — đang đào sâu vào Folder '%s' để lọc file .mp4...",
+                    drama_id, container_name, _entry_path(chosen_entry),
+                )
+
             mp4_entries = _collect_mp4_entries(
                 api, chosen_entry, root_uk, root_share_id, root_bdstoken, share_url,
-                target_folder_name=drama_id,
+                target_folder_name=drama_id.rsplit("/", 1)[-1],
             )
             mp4_entries = _enforce_mp4_hard_cap(mp4_entries, drama_id)
         else:
