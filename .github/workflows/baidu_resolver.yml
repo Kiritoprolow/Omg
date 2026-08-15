@@ -12,7 +12,13 @@ jobs:
     runs-on: ubuntu-latest
     # Chặn timeout job dài quá mức nếu Baidu API bị treo/rate-limit — tránh
     # tốn phút Actions miễn phí vô ích.
-    timeout-minutes: 10
+    # FIX (kiến trúc relay Telegram 15/08/2026): trước đây job CHỈ resolve
+    # dlink (luôn xong dưới 10 phút). Giờ job còn tải bằng aria2c + đẩy lên
+    # Telegram NGAY TRONG runner — với drama nhiều tập, tổng thời gian có
+    # thể lên tới hàng chục phút. Nâng lên 60 phút (khớp với timeout=3300s
+    # phía HF Space chờ webhook trong baidu_downloader.py) để không bị GH
+    # Actions tự kill job giữa chừng khi đang tải/upload dở.
+    timeout-minutes: 60
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -26,6 +32,12 @@ jobs:
           # libjpeg...) trên runner ubuntu-latest mặc định. Ép về 3.10 để
           # dùng được wheel dựng sẵn, cài nhanh và ổn định hơn hẳn.
           python-version: "3.10"
+
+      - name: Cài đặt aria2 (tải file bằng đa kết nối, băng thông runner cao)
+        # Kiến trúc relay Telegram 15/08/2026: script giờ tự tải file .mp4
+        # bằng aria2c (thay vì để HF Space tải trực tiếp từ Baidu, bị
+        # throttle nặng theo IP/tài khoản) rồi đẩy thẳng lên Telegram.
+        run: sudo apt-get update && sudo apt-get install -y aria2
 
       - name: Cài đặt baidupcs-py + requests
         run: pip install --upgrade baidupcs-py requests
@@ -44,6 +56,11 @@ jobs:
           # riêng của HF Spaces trước khi chạm tới webhook /baidu_webhook.
           # Không bắt buộc nếu Space là Public.
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          # Kiến trúc relay Telegram 15/08/2026 — KHÔNG bắt buộc: nếu thiếu
+          # 1 trong 2 biến này, resolve_baidu_share.py tự fallback về hành vi
+          # cũ (chỉ trả dlink Baidu cho HF Space tự tải), không lỗi.
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_UPLOAD_CHAT_ID: ${{ secrets.TELEGRAM_UPLOAD_CHAT_ID }}
           # Toàn bộ giá trị dưới đây đến từ client_payload mà HF Space gửi
           # kèm request repository_dispatch.
           JOB_ID: ${{ github.event.client_payload.job_id }}
