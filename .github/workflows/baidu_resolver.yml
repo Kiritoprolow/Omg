@@ -12,13 +12,16 @@ jobs:
     runs-on: ubuntu-latest
     # Chặn timeout job dài quá mức nếu Baidu API bị treo/rate-limit — tránh
     # tốn phút Actions miễn phí vô ích.
-    # FIX (kiến trúc relay Telegram 15/08/2026): trước đây job CHỈ resolve
-    # dlink (luôn xong dưới 10 phút). Giờ job còn tải bằng aria2c + đẩy lên
-    # Telegram NGAY TRONG runner — với drama nhiều tập, tổng thời gian có
-    # thể lên tới hàng chục phút. Nâng lên 60 phút (khớp với timeout=3300s
-    # phía HF Space chờ webhook trong baidu_downloader.py) để không bị GH
-    # Actions tự kill job giữa chừng khi đang tải/upload dở.
-    timeout-minutes: 60
+    # REVERT (15/08/2026): đã thử tải bằng aria2c ngay trong GH Actions rồi
+    # relay qua Telegram (cần timeout dài hơn), nhưng xác nhận Baidu bóp
+    # băng thông THEO TÀI KHOẢN chứ không theo network — băng thông 1Gbps
+    # của runner cũng vô dụng (job #537 chạy đủ 60 phút vẫn không xong).
+    # NGƯNG dùng relay Telegram (bỏ trống 2 secret TELEGRAM_BOT_TOKEN/
+    # TELEGRAM_UPLOAD_CHAT_ID bên dưới là đủ để code tự fallback dlink-only),
+    # nên đưa timeout về gần mức gốc — dlink-only luôn resolve nhanh, không
+    # cần margin dài, tránh ngốn oan phút Actions miễn phí có hạn (2000
+    # phút/tháng) nếu chẳng may job bị treo thật.
+    timeout-minutes: 15
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -32,12 +35,6 @@ jobs:
           # libjpeg...) trên runner ubuntu-latest mặc định. Ép về 3.10 để
           # dùng được wheel dựng sẵn, cài nhanh và ổn định hơn hẳn.
           python-version: "3.10"
-
-      - name: Cài đặt aria2 (tải file bằng đa kết nối, băng thông runner cao)
-        # Kiến trúc relay Telegram 15/08/2026: script giờ tự tải file .mp4
-        # bằng aria2c (thay vì để HF Space tải trực tiếp từ Baidu, bị
-        # throttle nặng theo IP/tài khoản) rồi đẩy thẳng lên Telegram.
-        run: sudo apt-get update && sudo apt-get install -y aria2
 
       - name: Cài đặt baidupcs-py + requests
         run: pip install --upgrade baidupcs-py requests
