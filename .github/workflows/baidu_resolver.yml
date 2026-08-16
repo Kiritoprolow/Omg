@@ -70,4 +70,5 @@ jobs:
           # toJSON() tường minh để luôn ra đúng chuỗi JSON hợp lệ dù
           # client_payload gửi mảng rỗng [] hay có phần tử.
           PROCESSED_DRAMA_IDS: ${{ toJSON(github.event.client_payload.processed_drama_ids) }}
+          CHUNK_REMOTE_PATHS: ${{ toJson(github.event.client_payload.remote_paths) }}
         run: python scripts/resolve_baidu_share.py
